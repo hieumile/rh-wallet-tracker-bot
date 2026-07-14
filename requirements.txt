@@ -1,0 +1,3 @@
+requests>=2.31
+python-dotenv>=1.0      # optional .env loading for GMGN_API_KEY
+openpyxl>=3.1           # Export xlsx.py workbook export
