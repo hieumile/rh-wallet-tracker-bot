@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 import config
 from ingestion import gmgn_client as gmgn
 from ingestion import dexscreener_client as dex
+from ingestion import blockscout_client as bs
 from scoring import wallet_aggregator as agg
 from scoring import wallet_scorer as scorer
 from scoring import watchlist as wl
@@ -278,7 +279,189 @@ def _build_windows(args) -> list[tuple[int | None, int | None]]:
             _parse_dt(args.date_from) if args.date_from else None,
             _parse_dt(args.date_to, end=True) if args.date_to else None,
         ))
-    return windows
+def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None, int | None]], limit: int = 50) -> tuple[list[agg.WalletAggregate], list[dict]]:
+    """
+    Fetch raw transfers from Blockscout, classify swaps against the pool,
+    reconstruct prices, calculate local wallet PnL, and return (aggregates, raw_trades).
+    """
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    # 1. Resolve block ranges
+    try:
+        latest_block = bs.get_latest_block_number()
+    except Exception:
+        latest_block = 9000000
+        
+    block_ranges = []
+    if not windows:
+        # Default: last 10,000 blocks
+        block_ranges.append((latest_block - 10000, latest_block))
+    else:
+        for s_ts, e_ts in windows:
+            s_blk = bs.get_block_by_timestamp(s_ts, latest_block) if s_ts else (latest_block - 20000)
+            e_blk = bs.get_block_by_timestamp(e_ts, latest_block) if e_ts else latest_block
+            block_ranges.append((s_blk, e_blk))
+            
+    # 2. Get Uniswap Pair address
+    pair_address = dex.get_primary_pair(token_address)
+    pool_addr = pair_address.get("pairAddress", "").lower() if pair_address else ""
+    if not pool_addr:
+        logger.warning("Could not find DEX pair for token %s. On-chain classification might fail.", token_address)
+        
+    # Get current WETH price to help with USD value estimation
+    weth_price = 1800.0  # fallback
+    try:
+        weth_pair = dex.get_primary_pair("0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73")
+        if weth_pair:
+            weth_price = float(weth_pair.get("priceUsd") or 1800.0)
+    except Exception:
+        pass
+
+    # 3. Pull all transfers in block ranges
+    all_transfers = []
+    for s_blk, e_blk in block_ranges:
+        logger.info("Fetching on-chain transfers for token from block %d to %d...", s_blk, e_blk)
+        try:
+            transfers = bs.get_token_transfers(token_address, s_blk, e_blk)
+            all_transfers.extend(transfers)
+        except Exception as e:
+            logger.error("Failed to fetch transfers: %s", e)
+            
+    logger.info("Found %d raw transfers on-chain.", len(all_transfers))
+    if not all_transfers:
+        return [], []
+        
+    # 4. Group transfers by transaction hash to classify trades
+    tx_groups = {}
+    for t in all_transfers:
+        tx_hash = t.get("transaction_hash")
+        tx_groups.setdefault(tx_hash, []).append(t)
+        
+    logger.info("Processing %d unique transactions...", len(tx_groups))
+    
+    trades = []
+    processed_count = 0
+    
+    # Cap processing to avoid rate limiting
+    tx_hashes = list(tx_groups.keys())[:1000]
+    if len(tx_groups) > 1000:
+        logger.warning("Capping scan at 1000 transactions to avoid rate limit throttling.")
+        
+    for tx_hash in tx_hashes:
+        try:
+            tx_legs = bs.get_transaction_token_transfers(tx_hash)
+        except Exception:
+            tx_legs = []
+            
+        for t in tx_groups[tx_hash]:
+            from_hash = (t.get("from") or {}).get("hash", "").lower()
+            to_hash = (t.get("to") or {}).get("hash", "").lower()
+            val_str = t.get("total", {}).get("value") or "0"
+            decimals = int(t.get("token", {}).get("decimals") or 18)
+            amount = float(val_str) / (10 ** decimals)
+            
+            side = None
+            wallet = None
+            if from_hash == pool_addr:
+                side = "buy"
+                wallet = to_hash
+            elif to_hash == pool_addr:
+                side = "sell"
+                wallet = from_hash
+                
+            if not side or wallet == pool_addr or not wallet:
+                continue
+                
+            # Reconstruct price using the other legs
+            usd_value = 0.0
+            for leg in tx_legs:
+                leg_token = (leg.get("token") or {}).get("address_hash", "").lower()
+                leg_val = float(leg.get("total", {}).get("value") or 0.0)
+                leg_dec = int((leg.get("token") or {}).get("decimals") or 18)
+                
+                # WETH
+                if leg_token == "0x0bd7d308f8e1639fab988df18a8011f41eacad73":
+                    usd_value = (leg_val / (10 ** leg_dec)) * weth_price
+                    break
+                # USDC / USDT
+                elif "usd" in (leg.get("token") or {}).get("symbol", "").lower():
+                    usd_value = leg_val / (10 ** leg_dec)
+                    break
+                    
+            # Fallback
+            if usd_value == 0.0 and pair_address:
+                usd_value = amount * float(pair_address.get("priceUsd") or 0.0)
+                
+            price_usd = usd_value / amount if amount > 0 else 0.0
+            
+            # Extract timestamp/block details
+            block_num = t.get("block_number")
+            approx_ts = now_ts - (latest_block - block_num) * 2
+            trades.append({
+                "transaction_hash": tx_hash,
+                "timestamp": approx_ts,
+                "wallet": wallet,
+                "side": side,
+                "token_amount": amount,
+                "usd_value": usd_value,
+                "price": price_usd,
+            })
+            
+        processed_count += 1
+        if processed_count % 100 == 0:
+            logger.info("Processed %d/%d transactions...", processed_count, len(tx_hashes))
+            
+    # 5. Group trades by wallet to calculate PnL
+    wallet_trades = {}
+    for tr in trades:
+        wallet_trades.setdefault(tr["wallet"], []).append(tr)
+        
+    aggregates = []
+    for wallet, w_trades in wallet_trades.items():
+        w_trades.sort(key=lambda x: x.get("timestamp") or 0)
+        
+        buys = [t for t in w_trades if t["side"] == "buy"]
+        sells = [t for t in w_trades if t["side"] == "sell"]
+        
+        total_buy_usd = sum(t["usd_value"] for t in buys)
+        total_sell_usd = sum(t["usd_value"] for t in sells)
+        total_buy_tokens = sum(t["token_amount"] for t in buys)
+        total_sell_tokens = sum(t["token_amount"] for t in sells)
+        
+        realized_profit = 0.0
+        pnl_ratio = 0.0
+        if total_buy_tokens > 0:
+            avg_buy_price = total_buy_usd / total_buy_tokens
+            matched_tokens = min(total_buy_tokens, total_sell_tokens)
+            realized_cost = matched_tokens * avg_buy_price
+            realized_revenue = 0.0
+            if total_sell_tokens > 0:
+                avg_sell_price = total_sell_usd / total_sell_tokens
+                realized_revenue = matched_tokens * avg_sell_price
+                
+            realized_profit = realized_revenue - realized_cost
+            if realized_cost > 0:
+                pnl_ratio = realized_profit / realized_cost
+                
+        a = agg.WalletAggregate(wallet=wallet, token_address=token_address)
+        a.buy_volume_usd = total_buy_usd
+        a.sell_volume_usd = total_sell_usd
+        a.realized_profit_usd = realized_profit
+        a.tags = ["onchain_trader"]
+        
+        # Mark as sniper if they bought in first 5% of block range
+        if w_trades and block_ranges:
+            first_block = min(r[0] for r in block_ranges)
+            last_block = max(r[1] for r in block_ranges)
+            range_len = last_block - first_block
+            if range_len > 0:
+                earliest_trade_block = min(t.get("timestamp") or last_block for t in w_trades)
+                if earliest_trade_block - first_block < range_len * 0.05:
+                    a.tags.append("sniper")
+                    
+        aggregates.append(a)
+        
+    aggregates.sort(key=lambda x: x.realized_profit_usd or 0.0, reverse=True)
+    return aggregates[:limit], trades
 
 
 def main():
@@ -299,6 +482,7 @@ def main():
     parser.add_argument("--txns", metavar="PATH", help="Dump raw ingested transactions (one row per buy/sell) to an .xlsx file — for testing ingestion.")
     parser.add_argument("--watchlist", metavar="PATH", default=config.WATCHLIST_PATH, help="Merge scored wallets into this JSON watchlist (Subsystem 3 input).")
     parser.add_argument("--no-watchlist", action="store_true", help="Score and print but do not write the watchlist file.")
+    parser.add_argument("--onchain", action="store_true", help="Ingest all transfers on-chain via Blockscout directly instead of GMGN.")
     args = parser.parse_args()
 
     if not config.GMGN_API_KEY:
@@ -313,42 +497,62 @@ def main():
         logger.info("Aggregates & transactions restricted to activity in these window(s).")
 
     token = args.token_address
+    trades = []
 
-    # Discovery: which tag(s) to pull.
-    if args.all:
-        tags: list[str | None] = [None]
-    elif args.tag:
-        tags = [args.tag]
+    if args.onchain:
+        aggregates, trades = build_onchain_aggregates(token, windows, limit=args.limit)
+        tags = ["onchain_trader"]
     else:
-        tags = list(config.INSIDER_TAGS)
+        # Discovery: which tag(s) to pull.
+        if args.all:
+            tags = [None]
+        elif args.tag:
+            tags = [args.tag]
+        else:
+            tags = list(config.INSIDER_TAGS)
 
-    merged: dict[str, agg.WalletAggregate] = {}
-    for tag in tags:
-        for a in build_aggregates(token, tag, args.limit):
-            # A wallet can match multiple tags; keep the richer row, merge tags.
-            if a.wallet in merged:
-                for t in a.tags:
-                    if t not in merged[a.wallet].tags:
-                        merged[a.wallet].tags.append(t)
-            else:
-                merged[a.wallet] = a
+        merged: dict[str, agg.WalletAggregate] = {}
+        for tag in tags:
+            for a in build_aggregates(token, tag, args.limit):
+                # A wallet can match multiple tags; keep the richer row, merge tags.
+                if a.wallet in merged:
+                    for t in a.tags:
+                        if t not in merged[a.wallet].tags:
+                            merged[a.wallet].tags.append(t)
+                else:
+                    merged[a.wallet] = a
 
-    aggregates = list(merged.values())
-    logger.info("%d unique wallets across tag(s) %s", len(aggregates), tags)
+        aggregates = list(merged.values())
+        logger.info("%d unique wallets across tag(s) %s", len(aggregates), tags)
 
-    # In windowed mode, per-token buy/sell/profit MUST come from activity within
-    # the window(s) (the trader summary is all-time). Drop wallets inactive then.
-    if windowed or args.activity:
-        aggregates = enrich_with_activity(
-            aggregates, token, windows=windows, drop_empty=windowed
-        )
-        if windowed:
-            logger.info("%d wallets active in the window(s)", len(aggregates))
+        # In windowed mode, per-token buy/sell/profit MUST come from activity within
+        # the window(s) (the trader summary is all-time). Drop wallets inactive then.
+        if windowed or args.activity:
+            aggregates = enrich_with_activity(
+                aggregates, token, windows=windows, drop_empty=windowed
+            )
+            if windowed:
+                logger.info("%d wallets active in the window(s)", len(aggregates))
 
     # Raw ingestion dump: one row per transaction (independent of scoring).
     if args.txns:
         from export_xlxs import export_transactions
-        events = collect_transactions(aggregates, token, windows=windows)
+        if args.onchain:
+            events = []
+            for t in trades:
+                events.append({
+                    "wallet": t["wallet"],
+                    "timestamp": t["timestamp"],
+                    "event_type": t["side"],
+                    "token": {"address": token, "symbol": "TOKEN"},
+                    "token_amount": t["token_amount"],
+                    "cost_usd": t["usd_value"],
+                    "gas_usd": 0.0,
+                    "tx_hash": t["transaction_hash"]
+                })
+        else:
+            events = collect_transactions(aggregates, token, windows=windows)
+            
         logger.info("Ingested %d raw transactions across %d wallets", len(events), len(aggregates))
         try:
             export_transactions(events, args.txns)

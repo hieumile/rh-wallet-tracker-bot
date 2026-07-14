@@ -2,7 +2,7 @@
 Wallet scoring engine (Subsystem 2).
 
 Turns a wallet's CROSS-TOKEN track record (GMGN wallet_stats, carried on a
-WalletAggregate) into a single 0..100 score, so a seed token's traders can be
+WalletAggregate) into a single 0 to 100 score, so a seed token's traders can be
 ranked into a list of wallets worth following. The seed token only supplies the
 candidate pool; the score is about the wallet's overall record, not its result
 on that one token — that's what makes a wallet worth tracking onto OTHER tokens
@@ -80,9 +80,9 @@ def _score_components(agg: WalletAggregate) -> dict[str, float]:
     else:
         moonshot_component = 0.0
 
-    experience_component = _clamp01(token_num / config.EXPERIENCE_FULL_TOKENS)
-
     tagset = {t.lower() for t in agg.tags}
+    is_fresh = "fresh_wallet" in tagset
+    experience_component = 1.0 if is_fresh else _clamp01(token_num / config.EXPERIENCE_FULL_TOKENS)
     tag_component = max((_TAG_CREDIT.get(t, 0.0) for t in tagset), default=0.0)
 
     return {
@@ -99,8 +99,20 @@ def _passes_filters(agg: WalletAggregate) -> bool:
     # No stats at all -> can't assess a track record -> not followable.
     if agg.winrate is None and agg.wallet_realized_profit is None:
         return False
-    if (agg.wallet_token_num or 0) < config.MIN_TOKEN_NUM:
+        
+    tagset = {t.lower() for t in agg.tags}
+
+    # 1. MEV Exclusions
+    if tagset.intersection(config.EXCLUDE_TAGS):
         return False
+    if agg.wallet_avg_holding_secs is not None and agg.wallet_avg_holding_secs < config.MIN_HOLDING_TIME_SECS:
+        return False
+
+    # 2. History & Profit Filters
+    is_fresh = "fresh_wallet" in tagset
+    if not is_fresh and (agg.wallet_token_num or 0) < config.MIN_TOKEN_NUM:
+        return False
+        
     if (agg.wallet_realized_profit or 0.0) < config.MIN_REALIZED_PROFIT_USD:
         return False
     if (agg.winrate or 0.0) < config.MIN_WINRATE:

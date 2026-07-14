@@ -28,6 +28,7 @@ import os
 from datetime import datetime, timezone
 
 from scoring.wallet_scorer import WalletScore
+from ingestion import blockscout_client as bs
 
 
 def _now_iso() -> str:
@@ -83,6 +84,45 @@ def upsert(
             "first_added": prev.get("first_added", now) if prev else now,
             "updated_at": now,
         }
+
+        # Trace parent wallet if it is a fresh wallet
+        tags_lower = {t.lower() for t in s.tags}
+        if "fresh_wallet" in tags_lower:
+            try:
+                tx = bs.get_oldest_funding_transaction(s.wallet)
+                if tx:
+                    parent_addr = (tx.get("from") or {}).get("hash", "").lower()
+                    is_contract = (tx.get("from") or {}).get("is_contract", False)
+                    # We check that it is a regular EOA (not a smart contract or pool)
+                    if parent_addr and not is_contract:
+                        prev_parent = existing.get(parent_addr)
+                        parent_seeds = set(prev_parent.get("seed_tokens", [])) if prev_parent else set()
+                        if seed_token:
+                            parent_seeds.add(seed_token)
+                        
+                        funded_set = set(prev_parent.get("funded_wallets", [])) if prev_parent else set()
+                        funded_set.add(s.wallet)
+                        
+                        existing[parent_addr] = {
+                            "wallet": parent_addr,
+                            "score": s.score,  # Inherit child's score
+                            "winrate": None,
+                            "realized_profit_usd": None,
+                            "pnl_ratio": None,
+                            "token_num": None,
+                            "moonshot_count": None,
+                            "tags": sorted(list(set(prev_parent.get("tags", []) if prev_parent else []).union({"insider_funder"}))),
+                            "insider_signals": sorted(list(set(prev_parent.get("insider_signals", []) if prev_parent else []).union({"insider_funder", f"funded_{s.wallet[:8]}"}))),
+                            "components": {},
+                            "seed_tokens": sorted(parent_seeds),
+                            "stats_period": stats_period,
+                            "first_added": prev_parent.get("first_added", now) if prev_parent else now,
+                            "updated_at": now,
+                            "funded_wallets": sorted(list(funded_set)),
+                        }
+            except Exception as e:
+                # Watchlist upsert should be robust against single Blockscout request failures
+                pass
 
     ranked = sorted(existing.values(), key=lambda e: e.get("score", 0), reverse=True)
     tmp = f"{path}.tmp"

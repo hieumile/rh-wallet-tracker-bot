@@ -140,6 +140,33 @@ def get_token_transfers(token_address: str, start_block: int, end_block: int) ->
     return transfers
 
 
+def get_address_token_transfers(
+    address_hash: str,
+    token_type: str = "ERC-20",
+    max_pages: int = 5,
+) -> list[dict]:
+    """
+    Pull all token-transfer events for a given address (wallet/contract),
+    across up to max_pages. Stops early if no more pages are found.
+    """
+    transfers: list[dict] = []
+    params: dict = {"type": token_type}
+    path = f"/addresses/{address_hash}/token-transfers"
+
+    for _ in range(max_pages):
+        data = _get(path, params=params)
+        items = data.get("items", [])
+        if not items:
+            break
+        transfers.extend(items)
+        next_params = data.get("next_page_params")
+        if not next_params:
+            break
+        params = next_params
+
+    return transfers
+
+
 def get_transaction_token_transfers(tx_hash: str) -> list[dict]:
     """
     Full set of token transfers that occurred inside a single transaction.
@@ -158,3 +185,59 @@ def get_transaction_logs(tx_hash: str) -> list[dict]:
     """
     data = _get(f"/transactions/{tx_hash}/logs")
     return data.get("items", [])
+
+
+def get_oldest_funding_transaction(wallet_address: str, max_pages: int = 50) -> dict | None:
+    """
+    Paginate to the very first transaction of a wallet and return the first
+    incoming coin transfer representing gas funding.
+    """
+    path = f"/addresses/{wallet_address}/transactions"
+    params = {}
+
+    for _ in range(max_pages):
+        data = _get(path, params=params)
+        items = data.get("items", [])
+        if not items:
+            return None
+
+        next_params = data.get("next_page_params")
+        if not next_params:
+            # We are on the oldest page. Search in reverse chronological order
+            # (oldest is at the end of the list) for the first incoming coin transfer.
+            for tx in reversed(items):
+                val_str = tx.get("value") or "0"
+                try:
+                    val = float(val_str)
+                except (ValueError, TypeError):
+                    val = 0.0
+                to_hash = (tx.get("to") or {}).get("hash", "").lower()
+                # Check if it was an incoming transfer of coin (native gas) to this wallet
+                if to_hash == wallet_address.lower() and val > 0:
+                    return tx
+            return None
+        params = next_params
+
+    return None
+
+
+def get_address_transactions(address_hash: str, max_pages: int = 2) -> list[dict]:
+    """
+    Pull general transactions for a given address.
+    """
+    txs: list[dict] = []
+    params: dict = {}
+    path = f"/addresses/{address_hash}/transactions"
+
+    for _ in range(max_pages):
+        data = _get(path, params=params)
+        items = data.get("items", [])
+        if not items:
+            break
+        txs.extend(items)
+        next_params = data.get("next_page_params")
+        if not next_params:
+            break
+        params = next_params
+
+    return txs

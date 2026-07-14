@@ -78,7 +78,10 @@ INSIDER_TAGS = ["rat_trader", "smart_degen", "sniper"]
 STATS_PERIOD = "30d"             # wallet_stats window: "7d" or "30d"
 MIN_TOKEN_NUM = 3                # exclude one/two-hit wonders (too little history)
 MIN_REALIZED_PROFIT_USD = 0.0    # must be net profitable over the period to follow
-MIN_WINRATE = 0.0                # optional floor (0..1); 0 = no floor
+MIN_WINRATE = 0.35               # require at least 35% winrate to avoid lucky gamblers
+MIN_HOLDING_TIME_SECS = 60       # discard high-frequency MEV/sandwich bots (under 1m hold)
+EXCLUDE_TAGS = {"sandwich_bot", "uniswap_v3_multicall"}
+
 
 # Composite score weights (points out of 100). Each component is normalized to
 # 0..1 then multiplied by its weight; see scoring/wallet_scorer.py.
@@ -96,5 +99,14 @@ EXPERIENCE_FULL_TOKENS = 30      # token_num that maxes the experience component
 # Persisted output that Subsystem 3 (signal generator) will consume.
 WATCHLIST_PATH = "watchlist.json"
 
+# --- Subsystem 3 (Signal Generator) ---
+# Common quote tokens on Robinhood Chain (in lowercase) to ignore as target assets
+QUOTE_TOKENS = {
+    "0x0bd7d308f8e1639fab988df18a8011f41eacad73": "WETH",
+}
+SIGNAL_LOOKBACK_HOURS = 24
+SIGNAL_STATE_PATH = "signal_state.json"
+
 # --- HTTP ---
+# Timeout for all outgoing HTTP requests
 REQUEST_TIMEOUT_SECONDS = 20

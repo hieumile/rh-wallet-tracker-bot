@@ -1,94 +1,92 @@
 # rh-wallet-tracker-bot
 
-Finds the wallets that trade a Robinhood-chain token profitably — insiders,
-snipers, and "smart money" — and ranks the ones worth following. You give it a
-token you already care about; it tells you **who trades it well**, aggregates
-each wallet's **buy / sell / profit**, and builds a scored **watchlist** you can
-later use to spot the tokens those wallets are buying next.
-
-All data comes from the GMGN API (buy/sell volumes, USD prices, realized profit,
-and smart-money tags), so there is no pool discovery or price reconstruction.
+Bot hỗ trợ quét và phát hiện các ví giao dịch hiệu quả (insiders, snipers, smart money) trên mạng lưới Robinhood Chain để tìm kiếm cơ hội đầu tư sớm.
 
 ---
 
-## Using the bot (for traders)
+## Tổng quan & Quy trình hệ thống
 
-### 1. One-time setup
+Hệ thống hoạt động qua 3 phân hệ (subsystems) khép kín để phát hiện tín hiệu dòng tiền:
 
+1.  **Thu thập dữ liệu (Ingestion)**: Quét ví qua GMGN (mặc định) để lấy danh sách Smart Money, hoặc quét trực tiếp On-chain (`--onchain`) từ Blockscout để tìm các ví Snipers tại thời điểm launch/spike.
+2.  **Đánh giá & Lọc ví (Scoring Engine)**: Loại bỏ các ví MEV/Sandwich (hold dưới 60s), áp dụng sàn winrate tối thiểu 35%, ưu tiên ví mới (`fresh_wallet`) và tự động truy vết ví mẹ cấp gas (`insider_funder`). Các ví đạt tiêu chuẩn được lưu vào `watchlist.json`.
+3.  **Phát tín hiệu (Signal Generator)**: Theo dõi danh sách ví trong watchlist để đưa ra cảnh báo giao dịch (`BUY/SELL`), cảnh báo ví mẹ cấp vốn cho ví con mới (`FUNDING`), và cảnh báo mua chung (`Co-Investment`).
+
+```mermaid
+graph TD
+    A[Token Mục Tiêu] -->|GMGN API / Blockscout --onchain| B(Thu Thập Ví)
+    B --> C[Scoring Engine: Lọc MEV & Winrate 35% + Truy vết ví cấp gas]
+    C -->|Gộp & Lưu| D[watchlist.json]
+    C -->|Xuất Báo Cáo| E[Spreadsheets Excel]
+    D -->|Live Scan| F[Signal Generator]
+    F --> G(Cảnh báo BUY/SELL / FUNDING / Co-Investment)
+```
+
+---
+
+## Hướng dẫn sử dụng
+
+### 1. Cài đặt & Cấu hình
+
+Cài đặt thư viện:
 ```bash
 pip install -r requirements.txt
 ```
 
-Create a `.env` file in the project root with your GMGN API key:
-
+Tạo file `.env` ở thư mục gốc của dự án:
 ```
-GMGN_API_KEY=your_key_here
+GMGN_API_KEY=your_gmgn_api_key_here
+BLOCKSCOUT_API_KEY=your_blockscout_api_key_here
 ```
 
-> You apply for a GMGN API key via GMGN's cooperation form; they email you the
-> key. Only the API key is needed for everything in this README.
+### 2. Tìm kiếm ví (Scraper Path)
 
-### 2. Run it
-
+Chạy lệnh để tìm kiếm và xếp hạng ví giao dịch dựa trên một token mẫu:
 ```bash
 python3 main.py <TOKEN_ADDRESS> [options]
 ```
 
-The bot prints two tables — a per-wallet buy/sell/profit summary and a ranked
-"wallets worth following" list — and (unless told not to) merges the scored
-wallets into `watchlist.json`.
+#### Các tùy chọn chính:
+*   `--tag <tag>`: Lọc ví theo nhãn của GMGN (`rat_trader`, `smart_degen`, `sniper`).
+*   `--limit <n>`: Giới hạn số lượng ví tải về (mặc định: 50).
+*   `--onchain`: Bật chế độ quét trực tiếp toàn bộ dữ liệu chuyển khoản trên Blockscout (hữu ích để bắt ví sniper ở những block đầu tiên khi launch).
+*   `--from <datetime>` / `--to <datetime>`: Giới hạn khoảng thời gian quét.
+*   `--export <path.xlsx>`: Xuất bảng tổng hợp hiệu suất ví ra file Excel.
+*   `--txns <path.xlsx>`: Xuất chi tiết tất cả giao dịch ra Excel. Hỗ trợ tự động gộp/cập nhật dữ liệu cũ (Approach B).
 
-### 3. Command reference
-
-| Part | What it does |
-|------|--------------|
-| `python3 main.py` | Runs the bot. |
-| `<TOKEN_ADDRESS>` | **Required.** The token contract you want to analyse, e.g. `0x020bfc65…18b4`. The bot finds the wallets that traded *this* token. |
-| `--tag <tag>` | Only look at wallets GMGN labels with this tag: `rat_trader` (insider / sneak trading), `smart_degen` (smart money), or `sniper` (bought at launch). Omit to scan all three by default. |
-| `--all` | Ignore tags — consider **every** top trader of the token, not just tagged ones. |
-| `--limit <n>` | How many traders to pull (per tag), max 100. Default 50. Lower = faster and gentler on rate limits. |
-| `--from <when>` / `--to <when>` | Restrict buy/sell/profit to a single time window (UTC). Accepts `2026-07-13`, `13/7/2026`, or with a time `13/7/2026 12:00`. A date with no time covers the whole day. |
-| `--window <START> <END>` | A time window, **repeatable** — pass it several times to combine multiple windows (a trade counts if it lands in any of them). Supports hour precision. |
-| `--stats-period <7d\|30d>` | Track-record window used for scoring winrate / profit. Default `30d`. |
-| `--export <file.xlsx>` | Write the per-wallet **summary** (buy/sell/profit, winrate, insider signals) to Excel. |
-| `--txns <file.xlsx>` | Write the **raw transactions** to Excel — a "Transactions" tab (one row per buy/sell) plus a "Wallet PnL" tab (combined buy/sell → cost basis + realized PnL per wallet). |
-| `--activity` | Recompute totals from raw transactions even without a time window (auditable, slower). |
-| `--no-stats` | Skip the GMGN track-record lookup. Faster, but disables scoring and the watchlist. |
-| `--watchlist <file.json>` | Where to save/merge the scored wallets. Default `watchlist.json`. Re-running on new tokens *adds* to it. |
-| `--no-watchlist` | Score and print, but don't write the watchlist file. |
-
-### 4. Examples
-
-**Example 1 — Who are the smart-money wallets on this token, and save them to my watchlist?**
-
+#### Ví dụ:
 ```bash
-python3 main.py 0x020bfc650a365f8bb26819deaabf3e21291018b4 \
-  --tag smart_degen --limit 30 --export cashcat_wallets.xlsx
+# Quét qua GMGN tìm smart money
+python3 main.py 0x020bfc650a365f8bb26819deaabf3e21291018b4 --tag smart_degen --export summary.xlsx
+
+# Quét trực tiếp on-chain block launch tìm snipers (nên quét khoảng thời gian ngắn)
+python3 main.py 0x020bfc650a365f8bb26819deaabf3e21291018b4 --onchain --from "14/07/2026 10:00" --to "14/07/2026 10:30" --txns txns.xlsx
 ```
 
-Pulls the top 30 smart-money traders of the token, ranks them by their 30-day
-track record, writes a per-wallet summary to `cashcat_wallets.xlsx`, and merges
-the followed wallets into `watchlist.json`.
+### 3. Theo dõi ví & Phát hiện tín hiệu (Signal Generator)
 
-**Example 2 — Pull the raw transactions during two specific time windows.**
-
+Sau khi tạo danh sách ví theo dõi trong `watchlist.json`, chạy bot theo dõi trực tiếp:
 ```bash
-python3 main.py 0x020bfc650a365f8bb26819deaabf3e21291018b4 --all --limit 50 \
-  --window "11/7/2026 05:00" "11/7/2026 06:00" \
-  --window "12/7/2026 20:00" "12/7/2026 22:00" \
-  --txns transactions.xlsx --no-stats --no-watchlist
+python3 main_signals.py [options]
 ```
 
-Looks at all top traders, keeps only trades inside 05:00–06:00 on 11 Jul **or**
-20:00–22:00 on 12 Jul (UTC), and dumps them to `transactions.xlsx` with a
-combined buy/sell PnL tab. `--no-stats --no-watchlist` keeps it to pure data
-ingestion.
+#### Các tính năng chính:
+*   **BUY/SELL**: Cảnh báo giao dịch ERC-20 của các ví trong watchlist.
+*   **FUNDING**: Cảnh báo khi ví mẹ (`insider_funder`) chuyển gas (ETH) cho ví mới để chuẩn bị giao dịch.
+*   **Co-Investment**: Phát hiện khi có từ 2 ví trở lên cùng mua một token trong khoảng thời gian ngắn.
 
-### 5. Good to know
+#### Các tùy chọn:
+*   `--min-score <n>`: Chỉ theo dõi ví có điểm số từ `<n>` trở lên.
+*   `--force`: Quét toàn bộ lịch sử (bỏ qua cursor lưu trữ).
+*   `--export <path.xlsx>`: Xuất lịch sử tín hiệu ra Excel.
 
-- **Use higher-activity tokens.** GMGN only indexes wallet data for tokens with
-  enough trading; small/new tokens may return no traders. The address in the
-  examples (CASHCAT) works well for testing.
-- **Rate limits.** Keep `--limit` modest (≤50) — the bot throttles itself, but
-  large pulls plus per-wallet lookups take time.
-- **All times are UTC**, and profit/prices are in USD.
+#### Ví dụ:
+```bash
+python3 main_signals.py --min-score 35 --export signals.xlsx
+```
+
+### 4. Cơ chế chấm điểm & Bộ lọc (Scoring Rules)
+
+*   **Loại bỏ MEV/Sandwich**: Ví bị gắn tag `sandwich_bot` hoặc có thời gian giữ token trung bình dưới 60 giây sẽ bị loại bỏ hoàn toàn.
+*   **Sàn Winrate**: Yêu cầu tỉ lệ thắng tối thiểu **35%** (`MIN_WINRATE = 0.35`).
+*   **Tối ưu ví mới (Fresh Wallet)**: Ví có nhãn `fresh_wallet` được ưu tiên giữ lại bất kể lịch sử giao dịch ngắn, đồng thời tự động truy vết ví mẹ đã chuyển gas cho nó để gán nhãn `insider_funder`.
