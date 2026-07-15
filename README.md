@@ -96,4 +96,4 @@ python3 main_signals.py --min-score 35 --export signals.xlsx
 
 *   **Loại bỏ MEV/Sandwich**: Ví bị gắn tag `sandwich_bot` hoặc có thời gian giữ token trung bình dưới 60 giây sẽ bị loại bỏ hoàn toàn.
 *   **Sàn Winrate**: Yêu cầu tỉ lệ thắng tối thiểu **35%** (`MIN_WINRATE = 0.35`).
-*   **Tối ưu ví mới (Fresh Wallet)**: Ví có nhãn `fresh_wallet` được ưu tiên giữ lại bất kể lịch sử giao dịch ngắn, đồng thời tự động truy vết ví mẹ đã chuyển gas cho nó để gán nhãn `insider_funder`.
+*   **Tối ưu ví mới (Fresh Wallet)**: Ví có nhãn `fresh_wallet` được ưu tiên giữ lại bất kể lịch sử giao dịch ngắn, đồng thời tự động truy vết ví chính đã chuyển gas cho nó để gán nhãn `insider_funder`.

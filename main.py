@@ -369,7 +369,7 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
                 side = "sell"
                 wallet = from_hash
                 
-            if not side or wallet == pool_addr or not wallet:
+            if not side or wallet == pool_addr or not wallet or amount <= 0.0:
                 continue
                 
             # Reconstruct price using the other legs

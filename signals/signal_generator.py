@@ -64,6 +64,9 @@ def classify_wallet_transfer(transfer: dict, wallet: str) -> dict | None:
     except (ValueError, TypeError):
         amount = 0.0
 
+    if amount <= 0.0:
+        return None
+
     tx_hash = transfer.get("transaction_hash")
     ts_str = transfer.get("timestamp")
     
