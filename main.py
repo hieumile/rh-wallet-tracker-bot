@@ -279,6 +279,7 @@ def _build_windows(args) -> list[tuple[int | None, int | None]]:
             _parse_dt(args.date_from) if args.date_from else None,
             _parse_dt(args.date_to, end=True) if args.date_to else None,
         ))
+    return windows
 def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None, int | None]], limit: int = 50) -> tuple[list[agg.WalletAggregate], list[dict]]:
     """
     Fetch raw transfers from Blockscout, classify swaps against the pool,
@@ -525,31 +526,44 @@ def main():
         aggregates = list(merged.values())
         logger.info("%d unique wallets across tag(s) %s", len(aggregates), tags)
 
-        # In windowed mode, per-token buy/sell/profit MUST come from activity within
-        # the window(s) (the trader summary is all-time). Drop wallets inactive then.
-        if windowed or args.activity:
-            aggregates = enrich_with_activity(
-                aggregates, token, windows=windows, drop_empty=windowed
-            )
-            if windowed:
-                logger.info("%d wallets active in the window(s)", len(aggregates))
+    # Pre-filter: enrich with stats and drop MEV/non-qualifying wallets early.
+    # This prevents downloading transactions or writing reports for sandwich/MEV bots.
+    if not args.no_stats:
+        enrich_with_stats(aggregates, period=args.stats_period)
+        initial_len = len(aggregates)
+        aggregates = [a for a in aggregates if scorer.passes_filters(a)]
+        logger.info(
+            "Filtered out %d MEV/non-qualifying wallets. %d wallets remaining.",
+            initial_len - len(aggregates), len(aggregates),
+        )
+
+    # In windowed mode (GMGN path), per-token buy/sell/profit MUST come from activity within
+    # the window(s) (the trader summary is all-time). Drop wallets inactive then.
+    if not args.onchain and (windowed or args.activity):
+        aggregates = enrich_with_activity(
+            aggregates, token, windows=windows, drop_empty=windowed
+        )
+        if windowed:
+            logger.info("%d wallets active in the window(s)", len(aggregates))
 
     # Raw ingestion dump: one row per transaction (independent of scoring).
     if args.txns:
         from export_xlxs import export_transactions
         if args.onchain:
             events = []
+            valid_wallets = {a.wallet for a in aggregates}
             for t in trades:
-                events.append({
-                    "wallet": t["wallet"],
-                    "timestamp": t["timestamp"],
-                    "event_type": t["side"],
-                    "token": {"address": token, "symbol": "TOKEN"},
-                    "token_amount": t["token_amount"],
-                    "cost_usd": t["usd_value"],
-                    "gas_usd": 0.0,
-                    "tx_hash": t["transaction_hash"]
-                })
+                if t["wallet"] in valid_wallets:
+                    events.append({
+                        "wallet": t["wallet"],
+                        "timestamp": t["timestamp"],
+                        "event_type": t["side"],
+                        "token": {"address": token, "symbol": "TOKEN"},
+                        "token_amount": t["token_amount"],
+                        "cost_usd": t["usd_value"],
+                        "gas_usd": 0.0,
+                        "tx_hash": t["transaction_hash"]
+                    })
         else:
             events = collect_transactions(aggregates, token, windows=windows)
             
@@ -559,9 +573,6 @@ def main():
             logger.info("Wrote transactions to %s", args.txns)
         except ValueError as e:
             logger.warning("Transactions export skipped: %s", e)
-
-    if not args.no_stats:
-        enrich_with_stats(aggregates, period=args.stats_period)
 
     print_table(aggregates)
 

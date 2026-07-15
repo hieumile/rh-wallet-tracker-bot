@@ -89,7 +89,7 @@ def upsert(
         tags_lower = {t.lower() for t in s.tags}
         if "fresh_wallet" in tags_lower:
             try:
-                tx = bs.get_oldest_funding_transaction(s.wallet)
+                tx = bs.get_oldest_funding_transaction(s.wallet, max_pages=3)
                 if tx:
                     parent_addr = (tx.get("from") or {}).get("hash", "").lower()
                     is_contract = (tx.get("from") or {}).get("is_contract", False)

@@ -48,11 +48,15 @@ python3 main.py <TOKEN_ADDRESS> [options]
 
 #### Các tùy chọn chính:
 *   `--tag <tag>`: Lọc ví theo nhãn của GMGN (`rat_trader`, `smart_degen`, `sniper`).
+*   `--all`: Bỏ qua bộ lọc tag, lấy tất cả ví top traders của token.
 *   `--limit <n>`: Giới hạn số lượng ví tải về (mặc định: 50).
-*   `--onchain`: Bật chế độ quét trực tiếp toàn bộ dữ liệu chuyển khoản trên Blockscout (hữu ích để bắt ví sniper ở những block đầu tiên khi launch).
-*   `--from <datetime>` / `--to <datetime>`: Giới hạn khoảng thời gian quét.
+*   `--onchain`: Bật chế độ quét trực tiếp dữ liệu chuyển khoản trên Blockscout (bắt ví sniper khi launch).
+*   `--from <datetime>` / `--to <datetime>`: Giới hạn khoảng thời gian quét (UTC).
+*   `--window <START> <END>`: Định nghĩa khung thời gian cụ thể (quét nhiều khoảng không liên tục).
+*   `--stats-period <7d|30d>`: Khoảng thời gian chấm điểm hiệu suất ví (mặc định: `30d`).
 *   `--export <path.xlsx>`: Xuất bảng tổng hợp hiệu suất ví ra file Excel.
-*   `--txns <path.xlsx>`: Xuất chi tiết tất cả giao dịch ra Excel. Hỗ trợ tự động gộp/cập nhật dữ liệu cũ (Approach B).
+*   `--txns <path.xlsx>`: Xuất chi tiết tất cả giao dịch ra Excel. Tự động gộp dữ liệu cũ (Approach B).
+*   `--watchlist <path.json>`: Đường dẫn lưu watchlist JSON (mặc định: `watchlist.json`).
 
 #### Ví dụ:
 ```bash
@@ -77,8 +81,11 @@ python3 main_signals.py [options]
 
 #### Các tùy chọn:
 *   `--min-score <n>`: Chỉ theo dõi ví có điểm số từ `<n>` trở lên.
-*   `--force`: Quét toàn bộ lịch sử (bỏ qua cursor lưu trữ).
+*   `--force`: Quét toàn bộ lịch sử (bỏ qua con trỏ trạng thái cursor).
+*   `--limit-pages <n>`: Số trang transfer quét tối đa trên Blockscout cho mỗi ví (mặc định: 2).
+*   `--co-only`: Chỉ in các cảnh báo mua chung (Co-Investment) lên terminal, ẩn giao dịch đơn lẻ.
 *   `--export <path.xlsx>`: Xuất lịch sử tín hiệu ra Excel.
+*   `--watchlist <path.json>`: Đường dẫn đọc file watchlist (mặc định: `watchlist.json`).
 
 #### Ví dụ:
 ```bash

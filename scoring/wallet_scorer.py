@@ -144,6 +144,11 @@ def score_wallet(agg: WalletAggregate) -> WalletScore | None:
     )
 
 
+def passes_filters(agg: WalletAggregate) -> bool:
+    """Public helper to filter MEV bots and sandwich bots early."""
+    return _passes_filters(agg)
+
+
 def rank_wallets(aggregates: list[WalletAggregate]) -> list[WalletScore]:
     """Score every aggregate and return the survivors ranked high to low."""
     scored = [score_wallet(a) for a in aggregates]
