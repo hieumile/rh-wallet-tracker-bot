@@ -30,24 +30,39 @@ class BlockscoutError(Exception):
 
 def _get(path: str, params: dict | None = None) -> dict:
     """
-    GET against the Blockscout Pro API with basic rate-limit backoff.
-    Retries once on 429 after respecting Retry-After (or a flat delay).
+    GET against the Blockscout Pro API with rate-limit and transient error backoff.
+    Retries on 429 and server-side errors (500, 502, 503, 504).
     """
     url = f"{config.BLOCKSCOUT_BASE_URL}{path}"
-    for attempt in range(2):
-        resp = _session.get(url, params=params, timeout=config.REQUEST_TIMEOUT_SECONDS)
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            resp = _session.get(url, params=params, timeout=config.REQUEST_TIMEOUT_SECONDS)
+        except Exception as e:
+            if attempt < max_attempts - 1:
+                logger.warning("Request failed for %s (attempt %d/%d): %s. Retrying in 2.0s...", path, attempt + 1, max_attempts, e)
+                time.sleep(2.0)
+                continue
+            raise
+
         if resp.status_code == 429:
             retry_after = float(resp.headers.get("Retry-After", 2.0))
             logger.warning("Rate limited on %s, sleeping %.1fs", path, retry_after)
             time.sleep(retry_after)
             continue
+
+        if resp.status_code in (500, 502, 503, 504) and attempt < max_attempts - 1:
+            logger.warning("Transient server error %d on %s (attempt %d/%d). Retrying in 2.0s...", resp.status_code, path, attempt + 1, max_attempts)
+            time.sleep(2.0)
+            continue
+
         if resp.status_code >= 400:
             raise BlockscoutError(
                 f"Blockscout GET {path} failed: {resp.status_code} {resp.text[:300]}"
             )
         time.sleep(config.BLOCKSCOUT_REQUEST_DELAY)  # stay under 5 RPS
         return resp.json()
-    raise BlockscoutError(f"Blockscout GET {path} failed after retry (still rate limited)")
+    raise BlockscoutError(f"Blockscout GET {path} failed after maximum retry attempts")
 
 
 def get_latest_block_number() -> int:
@@ -102,41 +117,93 @@ def get_block_by_timestamp(target_ts: int, latest_block: int | None = None) -> i
 def get_token_transfers(token_address: str, start_block: int, end_block: int) -> list[dict]:
     """
     Pull all token-transfer events for a given ERC-20 token contract
-    between start_block and end_block (inclusive), across as many pages
-    as needed. Stops early once transfers pass end_block (Blockscout
-    returns newest-first, so we page until we're past the window).
-
-    Returns raw transfer dicts as given by the API — classification into
-    buy/sell happens in classify.py, not here.
+    between start_block and end_block (inclusive) using direct JSON-RPC eth_getLogs
+    from the Robinhood Chain RPC.
     """
+    # 1. Fetch token details once from Blockscout to get decimals
+    decimals = 18
+    try:
+        token_info = _get(f"/tokens/{token_address}")
+        if token_info and "decimals" in token_info:
+            decimals = int(token_info["decimals"])
+    except Exception as e:
+        logger.warning("Could not fetch token decimals for %s: %s. Defaulting to 18.", token_address, e)
+
+    rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+    transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    
+    # Chunk size: 5,000 blocks to stay comfortably under standard RPC size/weight limits
+    chunk_size = 5000
     transfers: list[dict] = []
-    params: dict = {}
-    path = f"/tokens/{token_address}/transfers"
-
-    for _ in range(config.MAX_PAGES_PER_TOKEN):
-        data = _get(path, params=params or None)
-        items = data.get("items", [])
-        if not items:
-            break
-
-        stop = False
-        for item in items:
-            block_num = int(item["block_number"])
-            if block_num < start_block:
-                stop = True
-                break
-            if block_num <= end_block:
-                transfers.append(item)
-            # block_num > end_block: too recent, skip but keep paging back in time
-
-        if stop:
-            break
-
-        next_params = data.get("next_page_params")
-        if not next_params:
-            break
-        params = next_params
-
+    
+    current_start = start_block
+    while current_start <= end_block:
+        current_end = min(current_start + chunk_size - 1, end_block)
+        
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_getLogs",
+            "params": [{
+                "fromBlock": hex(current_start),
+                "toBlock": hex(current_end),
+                "address": token_address,
+                "topics": [transfer_topic]
+            }],
+            "id": 1
+        }
+        
+        success = False
+        for attempt in range(3):
+            try:
+                # Override auth headers from session to make a clean RPC call
+                r = requests.post(rpc_url, json=payload, headers={"Content-Type": "application/json"}, timeout=config.REQUEST_TIMEOUT_SECONDS)
+                if r.status_code == 200:
+                    data = r.json()
+                    if "error" in data:
+                        raise BlockscoutError(f"RPC Error: {data['error']}")
+                    
+                    results = data.get("result", [])
+                    for log in results:
+                        topics = log.get("topics") or []
+                        if len(topics) < 3:
+                            continue
+                        
+                        block_num = int(log["blockNumber"], 16)
+                        tx_hash = log["transactionHash"]
+                        from_addr = "0x" + topics[1][-40:]
+                        to_addr = "0x" + topics[2][-40:]
+                        
+                        val_hex = log.get("data") or "0x0"
+                        try:
+                            value = int(val_hex, 16)
+                        except ValueError:
+                            value = 0
+                            
+                        transfers.append({
+                            "block_number": block_num,
+                            "transaction_hash": tx_hash,
+                            "from": {"hash": from_addr},
+                            "to": {"hash": to_addr},
+                            "total": {"value": str(value)},
+                            "token": {"decimals": decimals, "address": token_address}
+                        })
+                    
+                    success = True
+                    break
+                else:
+                    logger.warning("RPC returned status %d (attempt %d/3), retrying...", r.status_code, attempt + 1)
+                    time.sleep(1.0)
+            except Exception as e:
+                logger.warning("RPC call failed (attempt %d/3): %s. Retrying...", attempt + 1, e)
+                time.sleep(1.0)
+                
+        if not success:
+            raise BlockscoutError(f"Failed to fetch RPC logs for block range {current_start}-{current_end}")
+            
+        current_start = current_end + 1
+        
+    # Sort transfers descending (newest block number first) to match Blockscout API sorting
+    transfers.sort(key=lambda x: x["block_number"], reverse=True)
     return transfers
 
 
@@ -169,13 +236,84 @@ def get_address_token_transfers(
 
 def get_transaction_token_transfers(tx_hash: str) -> list[dict]:
     """
-    Full set of token transfers that occurred inside a single transaction.
-    A swap typically shows two transfers moving in opposite directions
-    (token_in from wallet to pool, token_out from pool to wallet) —
-    this is the raw material for price reconstruction in classify.py.
+    Full set of token transfers that occurred inside a single transaction,
+    retrieved using direct RPC eth_getTransactionReceipt to avoid Blockscout rate/server limits.
     """
-    data = _get(f"/transactions/{tx_hash}/token-transfers")
-    return data.get("items", [])
+    rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+    transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_getTransactionReceipt",
+        "params": [tx_hash],
+        "id": 1
+    }
+    
+    legs: list[dict] = []
+    
+    for attempt in range(3):
+        try:
+            r = requests.post(rpc_url, json=payload, headers={"Content-Type": "application/json"}, timeout=config.REQUEST_TIMEOUT_SECONDS)
+            if r.status_code == 200:
+                data = r.json()
+                if "error" in data:
+                    raise BlockscoutError(f"RPC getTransactionReceipt Error: {data['error']}")
+                
+                receipt = data.get("result") or {}
+                logs = receipt.get("logs") or []
+                for log in logs:
+                    topics = log.get("topics") or []
+                    if len(topics) < 3:
+                        continue
+                    if topics[0].lower() != transfer_topic:
+                        continue
+                    
+                    addr = log.get("address", "").lower()
+                    from_addr = "0x" + topics[1][-40:]
+                    to_addr = "0x" + topics[2][-40:]
+                    
+                    val_hex = log.get("data") or "0x0"
+                    try:
+                        value = int(val_hex, 16)
+                    except ValueError:
+                        value = 0
+                        
+                    # Decimals configuration for common tokens
+                    decimals = 18
+                    symbol = "TOKEN"
+                    if addr == "0x0bd7d308f8e1639fab988df18a8011f41eacad73": # WETH
+                        symbol = "WETH"
+                        decimals = 18
+                    elif "usd" in addr: # Simple wildcard check for USDC/USDT etc
+                        symbol = "USD"
+                        decimals = 6
+                        
+                    legs.append({
+                        "token": {
+                            "address_hash": addr,
+                            "decimals": decimals,
+                            "symbol": symbol
+                        },
+                        "total": {
+                            "value": str(value)
+                        },
+                        "from": {
+                            "hash": from_addr
+                        },
+                        "to": {
+                            "hash": to_addr
+                        }
+                    })
+                return legs
+            else:
+                logger.warning("RPC getTransactionReceipt returned status %d, retrying...", r.status_code)
+                time.sleep(1.0)
+        except Exception as e:
+            logger.warning("RPC getTransactionReceipt failed: %s, retrying...", e)
+            time.sleep(1.0)
+            
+    logger.error("Failed to fetch RPC receipt for transaction %s after 3 attempts.", tx_hash)
+    return []
 
 
 def get_transaction_logs(tx_hash: str) -> list[dict]:

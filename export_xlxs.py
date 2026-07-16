@@ -154,13 +154,12 @@ def _wallet_pnl_rows(events: list[dict]) -> list[dict]:
     return rows
 
 
-def export_transactions(events: list[dict], output_path: str):
+def export_transactions(events: list[dict], output_path: str, raw_events: list[dict] = None):
     """
-    Two-tab workbook from raw GMGN wallet_activity events:
-      - "Transactions": one row per buy/sell (time, wallet, token address, side, symbol,
-        amount, USD value, gas, tx hash), newest first. Merges with existing transactions.
-      - "Wallet PnL": one row per wallet per token combining all its buys and sells, with
-        cost basis and realized PnL derived from those combined totals.
+    Workbook from raw wallet events:
+      - "Transactions": one row per buy/sell, newest first. Merges with existing transactions.
+      - "Wallet PnL": one row per wallet per token combining all its buys and sells, with PnL.
+      - "Raw Transactions": optional tab containing raw unfiltered logs with their filter status.
     """
     if not events:
         raise ValueError("No transactions to export — nothing was ingested.")
@@ -180,11 +179,9 @@ def export_transactions(events: list[dict], output_path: str):
     for ev in events:
         tx = ev.get("tx_hash")
         w = ev.get("wallet")
-        # Raw GMGN events have e['token']['address'] or fallback
         token_info = ev.get("token") or {}
         t = token_info.get("address") or ""
         key = (tx, w, t)
-        # Re-construct event format for consistency
         side = (ev.get("event_type") or ev.get("type") or "").lower()
         merged_map[key] = {
             "wallet": w,
@@ -288,6 +285,46 @@ def export_transactions(events: list[dict], output_path: str):
             "wallet that sold with no buy in the pulled data)."
         ),
     ).font = Font(name="Arial", italic=True, size=9, color="808080")
+
+    # ---------- Raw Transactions tab ----------
+    if raw_events:
+        ws3 = wb.create_sheet("Raw Transactions")
+        headers3 = [
+            "Time (UTC)", "Wallet", "Token Address", "Side", "Symbol",
+            "Token Amount", "Value (USD)", "Tx Hash", "Status / Filter Reason"
+        ]
+        ws3.append(headers3)
+        _style_header_row(ws3, 1, len(headers3))
+        
+        sorted_raw = sorted(raw_events, key=lambda e: int(e.get("timestamp") or 0), reverse=True)
+        
+        for e in sorted_raw:
+            token = e.get("token") or {}
+            ts = e.get("timestamp")
+            ws3.append([
+                _ts_to_dt(int(ts)) if ts else None,
+                e.get("wallet"),
+                token.get("address"),
+                (e.get("event_type") or "").upper(),
+                token.get("symbol"),
+                _num(e.get("token_amount")),
+                _num(e.get("cost_usd")),
+                e.get("tx_hash"),
+                e.get("status")
+            ])
+            r = ws3.max_row
+            for c in range(1, len(headers3) + 1):
+                ws3.cell(row=r, column=c).font = BODY_FONT
+            ws3.cell(row=r, column=1).number_format = "yyyy-mm-dd hh:mm:ss"
+            ws3.cell(row=r, column=6).number_format = "#,##0.########"
+            ws3.cell(row=r, column=7).number_format = "$#,##0.00"
+            
+        for i, header in enumerate(headers3, start=1):
+            ws3.column_dimensions[get_column_letter(i)].width = max(14, len(header) + 2)
+        ws3.column_dimensions["B"].width = 44  # wallet
+        ws3.column_dimensions["C"].width = 44  # token address
+        ws3.column_dimensions["H"].width = 68  # tx hash
+        ws3.column_dimensions["I"].width = 28  # status / reason
 
     wb.save(output_path)
 
@@ -533,4 +570,59 @@ def export_signals_report(signals: list[dict], co_investments: list[dict], outpu
     ws2.column_dimensions["C"].width = 44  # token address
     ws2.column_dimensions["G"].width = 80  # buyers string
 
+    wb.save(output_path)
+
+
+def export_watchlist(watchlist_map: dict[str, dict], output_path: str):
+    """
+    Export the scored wallet watchlist to an Excel sheet.
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Watchlist"
+    
+    headers = [
+        "Wallet", "Score", "Win Rate", "Realized Profit (USD)", "PnL Ratio",
+        "Token Count", "Moonshot Count", "Tags", "Insider Signals", "Seed Tokens", "Last Updated"
+    ]
+    ws.append(headers)
+    _style_header_row(ws, 1, len(headers))
+    
+    # Sort by score descending
+    sorted_entries = sorted(watchlist_map.values(), key=lambda e: float(e.get("score") or 0.0), reverse=True)
+    
+    for e in sorted_entries:
+        winrate = e.get("winrate")
+        # Format winrate to float if present
+        if winrate is not None:
+            winrate = float(winrate)
+            
+        ws.append([
+            e.get("wallet"),
+            _num(e.get("score")),
+            winrate,
+            _num(e.get("realized_profit_usd")),
+            _num(e.get("pnl_ratio")),
+            e.get("token_num"),
+            e.get("moonshot_count"),
+            ", ".join(e.get("tags") or []),
+            ", ".join(e.get("insider_signals") or []),
+            ", ".join(e.get("seed_tokens") or []),
+            e.get("updated_at")
+        ])
+        r = ws.max_row
+        for c in range(1, len(headers) + 1):
+            ws.cell(row=r, column=c).font = BODY_FONT
+        ws.cell(row=r, column=2).number_format = "0.0"
+        ws.cell(row=r, column=3).number_format = "0.0%"
+        ws.cell(row=r, column=4).number_format = "$#,##0.00"
+        ws.cell(row=r, column=5).number_format = "0.00"
+        
+    for i, header in enumerate(headers, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = max(14, len(header) + 2)
+    ws.column_dimensions["A"].width = 44  # wallet
+    ws.column_dimensions["H"].width = 30  # tags
+    ws.column_dimensions["I"].width = 40  # signals
+    ws.column_dimensions["J"].width = 30  # seed tokens
+    
     wb.save(output_path)

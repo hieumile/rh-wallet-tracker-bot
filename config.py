@@ -106,6 +106,9 @@ QUOTE_TOKENS = {
 }
 SIGNAL_LOOKBACK_HOURS = 24
 SIGNAL_STATE_PATH = "signal_state.json"
+MIN_SIGNAL_BUY_USD = 100.0  # Discard buys below this USD size (lottery tickets)
+MIN_CO_BUYERS = 2           # Minimum unique buyers required to flag a Co-Investment
+MIN_NET_ACCUMULATION_RATIO = 2.0  # Buying USD must be at least this multiple of selling USD
 
 # --- HTTP ---
 # Timeout for all outgoing HTTP requests

@@ -12,10 +12,15 @@ The score is a transparent weighted blend of normalized components, each in
 0..1, so every ranking is explainable (see WalletScore.components):
 
   winrate     ratio of profitable trades              (raw 0..1)
+  max drawdown
+  ti le lenh lai 
+  tx
   pnl_ratio   realized_profit / total_cost            (0..3x -> 0..1)
   profit      absolute realized profit                (log-scaled to a cap)
   moonshot    share of trades that returned > 2x      (0..1)
   experience  distinct tokens traded                  (0..cap -> 0..1)
+
+  giu nhung kcho vao diem 
   tags        GMGN smart_money / insider labels       (0/0.5/1.0)
 
 Hard filters (config) drop wallets we can't or shouldn't follow: too little

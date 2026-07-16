@@ -59,3 +59,25 @@ def get_primary_pair(token_address: str) -> dict | None:
     if not pairs:
         return None
     return max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+
+
+def search_token_address_by_symbol(symbol: str) -> str | None:
+    """
+    Search DEX Screener for pairs matching the symbol, filter for chainId == "robinhood",
+    and return the address of the token if found.
+    """
+    try:
+        url = f"/latest/dex/search"
+        data = _get(url, params={"q": symbol})
+        pairs = data.get("pairs") or []
+        rh_pairs = [p for p in pairs if p.get("chainId") == config.DEXSCREENER_CHAIN_SLUG]
+        if not rh_pairs:
+            return None
+        rh_pairs.sort(key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)
+        for p in rh_pairs:
+            base = p.get("baseToken", {})
+            if base.get("symbol", "").lower() == symbol.lower():
+                return base.get("address")
+    except Exception as e:
+        logger.warning("DEX Screener search failed for %s: %s", symbol, e)
+    return None

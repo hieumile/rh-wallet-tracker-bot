@@ -24,6 +24,13 @@ def _ts_label(ts: int | None) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
+def _fmt_amt(amt: float) -> str:
+    if amt is None:
+        return "N/A"
+    # Format with up to 4 decimal places, strip trailing zeros and dot
+    return f"{amt:,.4f}".rstrip('0').rstrip('.')
+
+
 def print_co_investments(co_investments: list[dict]):
     print("\n=== CO-INVESTMENTS DETECTED ===")
     print(f"{'Token':<12} {'Address':<44} {'Buyers':>6} {'Price':>10} {'Liquidity':>12}")
@@ -33,7 +40,7 @@ def print_co_investments(co_investments: list[dict]):
         print(f"{c['symbol']:<12} {c['token_address']:<44} {c['buyers_count']:>6} {price:>10} {liq:>12}")
         for b in c["buyers"]:
             time_str = _ts_label(b["timestamp"])
-            print(f"  - Buyer: {b['wallet']} | Score: {b['score']:.1f} | Amount: {b['amount']:,.0f} | Time: {time_str}")
+            print(f"  - Buyer: {b['wallet']} | Score: {b['score']:.1f} | Amount: {_fmt_amt(b['amount'])} | Time: {time_str}")
     if not co_investments:
         print("No co-investments detected.")
 
@@ -115,7 +122,7 @@ def print_signals_table(signals: list[dict], limit: int = 50):
                 for s in reversed(w_sigs_sorted): # print chronologically
                     t_time = datetime.fromtimestamp(s["timestamp"], tz=timezone.utc).strftime("%H:%M") if s["timestamp"] else "N/A"
                     val_str = f"${s['estimated_value_usd']:,.0f}" if s['estimated_value_usd'] is not None else "N/A"
-                    print(f"    * [{t_time}] {s['side']} {s['amount']:,.0f} {symbol} ({val_str})")
+                    print(f"    * [{t_time}] {s['side']} {_fmt_amt(s['amount'])} {symbol} ({val_str})")
         print()
     
     if not signals:
@@ -169,6 +176,22 @@ def main():
         try:
             export_signals_report(signals, co_investments, args.export)
             logger.info("Successfully exported signals to %s", args.export)
+            
+            # Auto-open exported signals Excel file
+            import platform
+            import subprocess
+            import os
+            try:
+                abs_path = os.path.abspath(args.export)
+                if platform.system() == "Darwin":
+                    subprocess.run(["open", abs_path], check=True)
+                elif platform.system() == "Windows":
+                    os.startfile(abs_path)
+                else:
+                    subprocess.run(["xdg-open", abs_path], check=True)
+                logger.info("Auto-opened signals report: %s", abs_path)
+            except Exception as ae:
+                logger.warning("Could not auto-open %s: %s", args.export, ae)
         except Exception as e:
             logger.error("Failed to export signals to Excel: %s", e)
 

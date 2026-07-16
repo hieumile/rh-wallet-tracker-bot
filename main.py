@@ -329,7 +329,7 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
             
     logger.info("Found %d raw transfers on-chain.", len(all_transfers))
     if not all_transfers:
-        return [], []
+        return [], [], []
         
     # 4. Group transfers by transaction hash to classify trades
     tx_groups = {}
@@ -340,6 +340,7 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
     logger.info("Processing %d unique transactions...", len(tx_groups))
     
     trades = []
+    raw_trades = []
     processed_count = 0
     
     # Cap processing to avoid rate limiting
@@ -347,18 +348,26 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
     if len(tx_groups) > 1000:
         logger.warning("Capping scan at 1000 transactions to avoid rate limit throttling.")
         
-    for tx_hash in tx_hashes:
-        try:
-            tx_legs = bs.get_transaction_token_transfers(tx_hash)
-        except Exception:
-            tx_legs = []
+    capped_set = set(tx_hashes)
+        
+    for tx_hash, group in tx_groups.items():
+        is_capped = tx_hash not in capped_set
+        
+        tx_legs = []
+        if not is_capped:
+            try:
+                tx_legs = bs.get_transaction_token_transfers(tx_hash)
+            except Exception:
+                tx_legs = []
             
-        for t in tx_groups[tx_hash]:
+        for t in group:
             from_hash = (t.get("from") or {}).get("hash", "").lower()
             to_hash = (t.get("to") or {}).get("hash", "").lower()
             val_str = t.get("total", {}).get("value") or "0"
             decimals = int(t.get("token", {}).get("decimals") or 18)
             amount = float(val_str) / (10 ** decimals)
+            block_num = int(t.get("block_number") or 0)
+            approx_ts = now_ts - (latest_block - block_num) * 2
             
             side = None
             wallet = None
@@ -369,47 +378,65 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
                 side = "sell"
                 wallet = from_hash
                 
-            if not side or wallet == pool_addr or not wallet or amount <= 0.0:
-                continue
+            # Classify status
+            if is_capped:
+                status = "CAPPED_LIMIT_EXCEEDED"
+            elif amount <= 0.0:
+                status = "ZERO_VALUE_SPAM"
+            elif not side or wallet == pool_addr or not wallet:
+                status = "NON_TRADE_TRANSFER"
+            else:
+                status = "PENDING"
                 
-            # Reconstruct price using the other legs
             usd_value = 0.0
-            for leg in tx_legs:
-                leg_token = (leg.get("token") or {}).get("address_hash", "").lower()
-                leg_val = float(leg.get("total", {}).get("value") or 0.0)
-                leg_dec = int((leg.get("token") or {}).get("decimals") or 18)
-                
-                # WETH
-                if leg_token == "0x0bd7d308f8e1639fab988df18a8011f41eacad73":
-                    usd_value = (leg_val / (10 ** leg_dec)) * weth_price
-                    break
-                # USDC / USDT
-                elif "usd" in (leg.get("token") or {}).get("symbol", "").lower():
-                    usd_value = leg_val / (10 ** leg_dec)
-                    break
+            if status == "PENDING":
+                # Reconstruct price using the other legs
+                for leg in tx_legs:
+                    leg_token = (leg.get("token") or {}).get("address_hash", "").lower()
+                    leg_val = float(leg.get("total", {}).get("value") or 0.0)
+                    leg_dec = int((leg.get("token") or {}).get("decimals") or 18)
                     
-            # Fallback
-            if usd_value == 0.0 and pair_address:
-                usd_value = amount * float(pair_address.get("priceUsd") or 0.0)
-                
+                    # WETH
+                    if leg_token == "0x0bd7d308f8e1639fab988df18a8011f41eacad73":
+                        usd_value = (leg_val / (10 ** leg_dec)) * weth_price
+                        break
+                    # USDC / USDT
+                    elif "usd" in (leg.get("token") or {}).get("symbol", "").lower():
+                        usd_value = leg_val / (10 ** leg_dec)
+                        break
+                        
+                # Fallback
+                if usd_value == 0.0 and pair_address:
+                    usd_value = amount * float(pair_address.get("priceUsd") or 0.0)
+                    
             price_usd = usd_value / amount if amount > 0 else 0.0
             
-            # Extract timestamp/block details
-            block_num = t.get("block_number")
-            approx_ts = now_ts - (latest_block - block_num) * 2
-            trades.append({
+            raw_trades.append({
                 "transaction_hash": tx_hash,
                 "timestamp": approx_ts,
-                "wallet": wallet,
-                "side": side,
+                "wallet": wallet or from_hash,
+                "side": side or "TRANSFER",
                 "token_amount": amount,
                 "usd_value": usd_value,
-                "price": price_usd,
+                "status": status,
+                "token": {"address": token_address, "symbol": "TOKEN"}
             })
             
-        processed_count += 1
-        if processed_count % 100 == 0:
-            logger.info("Processed %d/%d transactions...", processed_count, len(tx_hashes))
+            if status == "PENDING":
+                trades.append({
+                    "transaction_hash": tx_hash,
+                    "timestamp": approx_ts,
+                    "wallet": wallet,
+                    "side": side,
+                    "token_amount": amount,
+                    "usd_value": usd_value,
+                    "price": price_usd,
+                })
+            
+        if not is_capped:
+            processed_count += 1
+            if processed_count % 100 == 0:
+                logger.info("Processed %d/%d transactions...", processed_count, len(tx_hashes))
             
     # 5. Group trades by wallet to calculate PnL
     wallet_trades = {}
@@ -462,7 +489,7 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
         aggregates.append(a)
         
     aggregates.sort(key=lambda x: x.realized_profit_usd or 0.0, reverse=True)
-    return aggregates[:limit], trades
+    return aggregates[:limit], trades, raw_trades
 
 
 def main():
@@ -498,10 +525,9 @@ def main():
         logger.info("Aggregates & transactions restricted to activity in these window(s).")
 
     token = args.token_address
-    trades = []
-
+    raw_trades = []
     if args.onchain:
-        aggregates, trades = build_onchain_aggregates(token, windows, limit=args.limit)
+        aggregates, trades, raw_trades = build_onchain_aggregates(token, windows, limit=args.limit)
         tags = ["onchain_trader"]
     else:
         # Discovery: which tag(s) to pull.
@@ -549,8 +575,20 @@ def main():
     # Raw ingestion dump: one row per transaction (independent of scoring).
     if args.txns:
         from export_xlxs import export_transactions
+        raw_events = None
         if args.onchain:
+            # Fetch actual token symbol from DEX Screener
+            token_symbol = "TOKEN"
+            try:
+                from ingestion import dexscreener_client as dex
+                pair_address = dex.get_primary_pair(token)
+                if pair_address:
+                    token_symbol = pair_address.get("baseToken", {}).get("symbol") or "TOKEN"
+            except Exception:
+                pass
+
             events = []
+            raw_events = []
             valid_wallets = {a.wallet for a in aggregates}
             for t in trades:
                 if t["wallet"] in valid_wallets:
@@ -558,18 +596,36 @@ def main():
                         "wallet": t["wallet"],
                         "timestamp": t["timestamp"],
                         "event_type": t["side"],
-                        "token": {"address": token, "symbol": "TOKEN"},
+                        "token": {"address": token, "symbol": token_symbol},
                         "token_amount": t["token_amount"],
                         "cost_usd": t["usd_value"],
                         "gas_usd": 0.0,
                         "tx_hash": t["transaction_hash"]
                     })
+                    
+            for t in raw_trades:
+                status = t["status"]
+                if status == "PENDING":
+                    if t["wallet"] in valid_wallets:
+                        status = "CLEAN_TRADE"
+                    else:
+                        status = "MEV_OR_NON_QUALIFYING"
+                raw_events.append({
+                    "wallet": t["wallet"],
+                    "timestamp": t["timestamp"],
+                    "event_type": t["side"],
+                    "token": {"address": token, "symbol": token_symbol},
+                    "token_amount": t["token_amount"],
+                    "cost_usd": t["usd_value"],
+                    "tx_hash": t["transaction_hash"],
+                    "status": status
+                })
         else:
             events = collect_transactions(aggregates, token, windows=windows)
             
         logger.info("Ingested %d raw transactions across %d wallets", len(events), len(aggregates))
         try:
-            export_transactions(events, args.txns)
+            export_transactions(events, args.txns, raw_events=raw_events)
             logger.info("Wrote transactions to %s", args.txns)
         except ValueError as e:
             logger.warning("Transactions export skipped: %s", e)
@@ -600,6 +656,43 @@ def main():
             "Watchlist updated: +%d scored from this token, %d wallets total -> %s",
             len(scores), len(watchlist_map), args.watchlist,
         )
+        
+        # Export watchlist to Excel as well
+        try:
+            from export_xlxs import export_watchlist
+            watchlist_xlsx = args.watchlist.replace(".json", ".xlsx")
+            export_watchlist(watchlist_map, watchlist_xlsx)
+            logger.info("Watchlist Excel exported -> %s", watchlist_xlsx)
+        except Exception as e:
+            logger.warning("Watchlist Excel export failed: %s", e)
+
+    # --- Auto-open all generated Excel reports ---
+    import platform
+    import subprocess
+    import os
+    
+    def auto_open(path: str):
+        if not path or not os.path.exists(path):
+            return
+        try:
+            abs_path = os.path.abspath(path)
+            if platform.system() == "Darwin":
+                subprocess.run(["open", abs_path], check=True)
+            elif platform.system() == "Windows":
+                os.startfile(abs_path)
+            else:
+                subprocess.run(["xdg-open", abs_path], check=True)
+            logger.info("Auto-opened report: %s", abs_path)
+        except Exception as e:
+            logger.warning("Could not auto-open %s: %s", abs_path, e)
+
+    if args.txns:
+        auto_open(args.txns)
+    if args.export:
+        auto_open(args.export)
+    if not args.no_watchlist:
+        watchlist_xlsx = args.watchlist.replace(".json", ".xlsx")
+        auto_open(watchlist_xlsx)
 
 
 if __name__ == "__main__":

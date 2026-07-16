@@ -302,9 +302,30 @@ def generate_signals(
                 meta_cache[t_addr] = enrich_token_metadata(t_addr)
             meta = meta_cache[t_addr]
 
+        price_usd = meta.get("price_usd") or 0.0
+
+        # Filter out low-conviction signals (less than config.MIN_SIGNAL_BUY_USD)
+        filtered_sigs = []
+        for s in sigs:
+            if s["side"] in ("BUY", "SELL"):
+                val_usd = s["amount"] * price_usd if (s["amount"] and price_usd) else 0.0
+                if price_usd > 0.0 and val_usd < config.MIN_SIGNAL_BUY_USD:
+                    continue
+            filtered_sigs.append(s)
+
+        if not filtered_sigs:
+            continue
+
         # Determine co-investment buys
-        buys = [s for s in sigs if s["side"] == "BUY"]
-        if len(buys) >= 2:
+        buys = [s for s in filtered_sigs if s["side"] == "BUY"]
+        sells = [s for s in filtered_sigs if s["side"] == "SELL"]
+
+        # Net accumulation check: only include if buying USD exceeds selling USD in the window
+        total_buy_usd = sum(b["amount"] * price_usd for b in buys) if price_usd else 0.0
+        total_sell_usd = sum(sl["amount"] * price_usd for sl in sells) if price_usd else 0.0
+        is_net_accumulation = total_buy_usd >= total_sell_usd * config.MIN_NET_ACCUMULATION_RATIO or not sells
+
+        if len(buys) >= config.MIN_CO_BUYERS and is_net_accumulation:
             co_investments.append({
                 "token_address": t_addr,
                 "symbol": meta["symbol"] if meta["symbol"] != "TOKEN" else sigs[0]["symbol"],
@@ -325,7 +346,8 @@ def generate_signals(
                 ]
             })
 
-        for s in sigs:
+        for s in filtered_sigs:
+            val_usd = (s["amount"] * meta["price_usd"]) if (s["amount"] and meta["price_usd"]) else None
             processed_signals.append({
                 "timestamp": s["timestamp"],
                 "wallet": s["wallet"],
@@ -337,7 +359,7 @@ def generate_signals(
                 "symbol": meta["symbol"] if meta["symbol"] != "TOKEN" else s["symbol"],
                 "name": meta["name"] if meta["name"] != "Token" else s["name"],
                 "amount": s["amount"],
-                "estimated_value_usd": (s["amount"] * meta["price_usd"]) if (s["amount"] and meta["price_usd"]) else None,
+                "estimated_value_usd": val_usd,
                 "price_usd": meta["price_usd"],
                 "liquidity_usd": meta["liquidity_usd"],
                 "tx_hash": s["tx_hash"],
