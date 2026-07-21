@@ -55,6 +55,11 @@ class WalletScore:
     pnl_ratio: float | None
     token_num: int | None
     moonshot_count: int | None
+    max_drawdown_ratio: float | None = None
+    volume_usd: float | None = None
+    profit_factor: float | None = None
+    sharpe_ratio: float | None = None
+    tx_count: int | None = None
     tags: list[str] = field(default_factory=list)
     insider_signals: list[str] = field(default_factory=list)
     components: dict[str, float] = field(default_factory=dict)
@@ -62,6 +67,86 @@ class WalletScore:
 
 def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
+
+
+def calculate_advanced_metrics(activities: list[dict]) -> tuple[float, float, float]:
+    """
+    Calculate (max_drawdown_ratio, profit_factor, sharpe_ratio) 
+    from the wallet's chronological realized PnL curve.
+    """
+    sell_trades = []
+    for a in activities:
+        atype = (a.get("event_type") or a.get("type") or "").lower()
+        if atype != "sell":
+            continue
+        
+        try:
+            cost_usd = float(a.get("cost_usd")) if a.get("cost_usd") is not None else None
+            buy_cost_usd = float(a.get("buy_cost_usd")) if a.get("buy_cost_usd") is not None else None
+        except (ValueError, TypeError):
+            continue
+            
+        ts = a.get("timestamp")
+        
+        if cost_usd is not None and buy_cost_usd is not None and ts is not None:
+            profit = cost_usd - buy_cost_usd
+            sell_trades.append({
+                "timestamp": int(ts),
+                "profit": profit
+            })
+            
+    if not sell_trades:
+        return 0.0, 0.0, 0.0
+        
+    sell_trades.sort(key=lambda x: x["timestamp"])
+    
+    # 1. Profit Factor calculation
+    total_gains = sum(t["profit"] for t in sell_trades if t["profit"] > 0.0)
+    total_losses = sum(abs(t["profit"]) for t in sell_trades if t["profit"] < 0.0)
+    
+    if total_losses == 0.0:
+        profit_factor = 10.0 if total_gains > 0.0 else 0.0
+    else:
+        profit_factor = total_gains / total_losses
+
+    # 2. Sharpe Ratio calculation of trade profits
+    profits = [t["profit"] for t in sell_trades]
+    n = len(profits)
+    if n < 2:
+        sharpe_ratio = 0.0
+    else:
+        mean_p = sum(profits) / n
+        variance = sum((p - mean_p) ** 2 for p in profits) / (n - 1)
+        std_p = math.sqrt(variance)
+        if std_p == 0.0:
+            sharpe_ratio = 0.0
+        else:
+            sharpe_ratio = mean_p / std_p
+
+    # 3. Max Drawdown ratio calculation
+    current_pnl = 0.0
+    pnl_history = [0.0]
+    for t in sell_trades:
+        current_pnl += t["profit"]
+        pnl_history.append(current_pnl)
+        
+    max_dd = 0.0
+    peak = 0.0
+    
+    for pnl in pnl_history:
+        if pnl > peak:
+            peak = pnl
+        
+        dd = peak - pnl
+        if dd > max_dd:
+            max_dd = dd
+            
+    if peak <= 0.0:
+        dd_ratio = 1.0 if current_pnl < 0.0 else 0.0
+    else:
+        dd_ratio = max_dd / peak
+        
+    return dd_ratio, profit_factor, sharpe_ratio
 
 
 def _score_components(agg: WalletAggregate) -> dict[str, float]:
@@ -79,6 +164,22 @@ def _score_components(agg: WalletAggregate) -> dict[str, float]:
         cap = math.log10(max(10.0, config.PROFIT_FULL_SCORE_USD))
         profit_component = _clamp01(math.log10(profit) / cap)
 
+    # Volume component (log-scaled to cap)
+    volume = agg.wallet_volume_usd or 0.0
+    if volume <= 0:
+        volume_component = 0.0
+    else:
+        vol_cap = math.log10(max(10.0, config.VOLUME_FULL_SCORE_USD))
+        volume_component = _clamp01(math.log10(volume) / vol_cap)
+
+    # Profit Factor component (capped at PROFIT_FACTOR_CAP)
+    pf = agg.wallet_profit_factor or 0.0
+    pf_component = _clamp01(pf / config.PROFIT_FACTOR_CAP)
+
+    # Sharpe Ratio component (capped at SHARPE_CAP)
+    sharpe = agg.wallet_sharpe_ratio or 0.0
+    sharpe_component = _clamp01(sharpe / config.SHARPE_CAP)
+
     token_num = agg.wallet_token_num or 0
     if token_num > 0 and agg.wallet_moonshot_count is not None:
         moonshot_component = _clamp01(agg.wallet_moonshot_count / token_num)
@@ -88,15 +189,21 @@ def _score_components(agg: WalletAggregate) -> dict[str, float]:
     tagset = {t.lower() for t in agg.tags}
     is_fresh = "fresh_wallet" in tagset
     experience_component = 1.0 if is_fresh else _clamp01(token_num / config.EXPERIENCE_FULL_TOKENS)
-    tag_component = max((_TAG_CREDIT.get(t, 0.0) for t in tagset), default=0.0)
+
+    # Drawdown component: (1.0 - drawdown_ratio) clamped to 0..1
+    dd_ratio = agg.wallet_max_drawdown_ratio or 0.0
+    drawdown_component = _clamp01(1.0 - dd_ratio)
 
     return {
         "winrate": _clamp01(winrate),
         "pnl_ratio": pnl_component,
         "profit": profit_component,
+        "volume": volume_component,
+        "profit_factor": pf_component,
+        "sharpe": sharpe_component,
+        "drawdown": drawdown_component,
         "moonshot": moonshot_component,
         "experience": experience_component,
-        "tags": tag_component,
     }
 
 
@@ -122,6 +229,19 @@ def _passes_filters(agg: WalletAggregate) -> bool:
         return False
     if (agg.winrate or 0.0) < config.MIN_WINRATE:
         return False
+
+    # 3. Drawdown Limit Filter
+    if agg.wallet_max_drawdown_ratio is not None and agg.wallet_max_drawdown_ratio > config.MAX_DRAWDOWN_RATIO_LIMIT:
+        return False
+
+    # 4. Bot transaction count filter
+    if agg.wallet_tx_count is not None and agg.wallet_tx_count > config.MAX_TX_COUNT:
+        return False
+
+    # 5. Volume floor filter (ensures active trading history)
+    if agg.wallet_volume_usd is not None and agg.wallet_volume_usd < config.MIN_VOLUME_USD:
+        return False
+
     return True
 
 
@@ -143,6 +263,11 @@ def score_wallet(agg: WalletAggregate) -> WalletScore | None:
         pnl_ratio=agg.wallet_pnl_ratio,
         token_num=agg.wallet_token_num,
         moonshot_count=agg.wallet_moonshot_count,
+        max_drawdown_ratio=agg.wallet_max_drawdown_ratio,
+        volume_usd=agg.wallet_volume_usd,
+        profit_factor=agg.wallet_profit_factor,
+        sharpe_ratio=agg.wallet_sharpe_ratio,
+        tx_count=agg.wallet_tx_count,
         tags=list(agg.tags),
         insider_signals=insider_signals(agg),
         components={k: round(v, 3) for k, v in components.items()},

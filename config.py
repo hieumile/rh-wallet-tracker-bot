@@ -77,21 +77,31 @@ INSIDER_TAGS = ["rat_trader", "smart_degen", "sniper"]
 # the single seed token — the seed token only supplies the candidate pool.
 STATS_PERIOD = "30d"             # wallet_stats window: "7d" or "30d"
 MIN_TOKEN_NUM = 3                # exclude one/two-hit wonders (too little history)
-MIN_REALIZED_PROFIT_USD = 0.0    # must be net profitable over the period to follow
-MIN_WINRATE = 0.35               # require at least 35% winrate to avoid lucky gamblers
+MIN_REALIZED_PROFIT_USD = 100.0  # must make at least $100 net profit over the period
+MIN_VOLUME_USD = 500.0           # must trade at least $500 total volume to ensure active trading
+MIN_WINRATE = 0.50               # require at least 50% winrate to avoid lucky gamblers
 MIN_HOLDING_TIME_SECS = 60       # discard high-frequency MEV/sandwich bots (under 1m hold)
 EXCLUDE_TAGS = {"sandwich_bot", "uniswap_v3_multicall"}
+MAX_DRAWDOWN_RATIO_LIMIT = 0.60  # exclude wallets with max drawdown > 60% of peak profit
+MAX_TX_COUNT = 300               # exclude wallets with > 300 transactions in period (trading bots)
+MIN_WATCHLIST_SCORE = 40.0       # minimum composite score required to enter the watchlist
+PROFIT_FACTOR_CAP = 2.0          # profit factor that maxes the profit_factor component
+SHARPE_CAP = 1.5                 # Sharpe ratio that maxes the sharpe component
+VOLUME_FULL_SCORE_USD = 200_000  # trading volume (USD) that maxes the volume component
 
 
 # Composite score weights (points out of 100). Each component is normalized to
 # 0..1 then multiplied by its weight; see scoring/wallet_scorer.py.
 SCORE_WEIGHTS = {
-    "winrate": 25,      # ratio of profitable trades
-    "pnl_ratio": 20,    # realized_profit / total_cost
-    "profit": 20,       # absolute realized profit (log-scaled)
-    "moonshot": 15,     # share of trades that returned > 2x
+    "winrate": 10,      # ratio of profitable trades
+    "pnl_ratio": 10,    # realized_profit / total_cost
+    "profit": 15,       # absolute realized profit (log-scaled)
+    "volume": 10,       # overall trading volume (log-scaled)
+    "profit_factor": 15, # gross profit / gross loss
+    "sharpe": 10,       # risk-adjusted return ratio
+    "drawdown": 10,     # control of maximum asset drawdown from peak
+    "moonshot": 10,     # share of trades that returned > 2x
     "experience": 10,   # number of distinct tokens traded (anti-luck)
-    "tags": 10,         # GMGN smart_money / insider tags
 }
 PROFIT_FULL_SCORE_USD = 100_000  # realized profit that maxes the profit component
 EXPERIENCE_FULL_TOKENS = 30      # token_num that maxes the experience component

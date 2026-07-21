@@ -47,7 +47,15 @@ def _resolve_token(token_input: str) -> str:
         print(f"Found address for '{token_input}': {resolved}")
         return resolved
         
-    # Fallback: return raw string and let parser flag it if invalid
+    # Fallback: return raw string but validate it is a valid EVM address format
+    if not (token_input.startswith("0x") and len(token_input) == 42):
+        print(
+            f"\nERROR: '{token_input}' is not a valid EVM address format.\n"
+            f"Robinhood Chain requires a 42-character hex address starting with '0x' (e.g., 0x39dbed3a...).\n"
+            f"It looks like you passed a Solana address (pump.fun) or an invalid contract."
+        )
+        sys.exit(1)
+        
     return token_input
 
 

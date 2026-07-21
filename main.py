@@ -122,6 +122,18 @@ def enrich_with_stats(aggregates: list[agg.WalletAggregate], period: str) -> Non
             if w in by_wallet:
                 agg.apply_stats(by_wallet[w], stats)
                 by_wallet[w].stats_period = period
+                
+                # Fetch wallet activity to calculate max drawdown, profit factor, and Sharpe ratio
+                try:
+                    from scoring import wallet_scorer
+                    # Fetch 1 page of recent transactions (50 events)
+                    activities = gmgn.get_wallet_activity(w, max_pages=1)
+                    dd_ratio, pf, sharpe = wallet_scorer.calculate_advanced_metrics(activities)
+                    by_wallet[w].wallet_max_drawdown_ratio = dd_ratio
+                    by_wallet[w].wallet_profit_factor = pf
+                    by_wallet[w].wallet_sharpe_ratio = sharpe
+                except Exception as ae:
+                    logger.warning("Failed to calculate advanced metrics for %s: %s", w, ae)
 
 
 def enrich_with_activity(
@@ -216,17 +228,21 @@ def print_table(aggregates: list[agg.WalletAggregate]) -> None:
 def print_scores(scores: list[scorer.WalletScore]) -> None:
     print(
         f"\n=== WALLETS WORTH FOLLOWING (ranked) ===\n"
-        f"{'wallet':<44} {'score':>6} {'win%':>6} {'profit$':>13} "
-        f"{'pnl':>5} {'toks':>5}  {'signals':<32}"
+        f"{'wallet':<44} {'score':>6} {'win%':>6} {'profit$':>10} "
+        f"{'vol$':>10} {'pf':>5} {'sr':>5} {'txs':>5} {'dd%':>5}  {'signals':<32}"
     )
     for s in scores:
         win = f"{s.winrate*100:5.1f}" if s.winrate is not None else "   - "
         profit = s.realized_profit_usd if s.realized_profit_usd is not None else 0.0
-        pnl = f"{s.pnl_ratio:4.2f}" if s.pnl_ratio is not None else "  - "
+        vol = s.volume_usd if s.volume_usd is not None else 0.0
+        pf_str = f"{s.profit_factor:4.2f}" if s.profit_factor is not None else "  - "
+        sr_str = f"{s.sharpe_ratio:4.2f}" if s.sharpe_ratio is not None else "  - "
+        txs_str = f"{s.tx_count:4d}" if s.tx_count is not None else "   -"
+        dd_str = f"{s.max_drawdown_ratio*100:4.1f}" if s.max_drawdown_ratio is not None else "  - "
         sig = ", ".join(s.insider_signals)[:32]
         print(
-            f"{s.wallet:<44} {s.score:>6.1f} {win:>6} {profit:>13,.0f} "
-            f"{pnl:>5} {s.token_num or 0:>5}  {sig:<32}"
+            f"{s.wallet:<44} {s.score:>6.1f} {win:>6} {profit:>10,.0f} "
+            f"{vol:>10,.0f} {pf_str:>5} {sr_str:>5} {txs_str:>5} {dd_str:>5}  {sig:<32}"
         )
     if not scores:
         print("No wallets cleared the follow-worthiness filters "
@@ -299,7 +315,11 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
     else:
         for s_ts, e_ts in windows:
             s_blk = bs.get_block_by_timestamp(s_ts, latest_block) if s_ts else (latest_block - 20000)
+            if s_ts:
+                s_blk = max(0, s_blk - 15000)
             e_blk = bs.get_block_by_timestamp(e_ts, latest_block) if e_ts else latest_block
+            if e_ts:
+                e_blk = e_blk + 15000
             block_ranges.append((s_blk, e_blk))
             
     # 2. Get Uniswap Pair address
@@ -309,13 +329,15 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
         logger.warning("Could not find DEX pair for token %s. On-chain classification might fail.", token_address)
         
     # Get current WETH price to help with USD value estimation
-    weth_price = 1800.0  # fallback
+    weth_price = 3000.0  # fallback
     try:
-        weth_pair = dex.get_primary_pair("0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73")
-        if weth_pair:
-            weth_price = float(weth_pair.get("priceUsd") or 1800.0)
-    except Exception:
-        pass
+        import requests
+        r = requests.get("https://api.dexscreener.com/latest/dex/pairs/ethereum/0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640", timeout=5).json()
+        pair_data = r.get("pair") or {}
+        if pair_data.get("priceUsd"):
+            weth_price = float(pair_data.get("priceUsd"))
+    except Exception as e:
+        logger.warning("Could not fetch global WETH price: %s", e)
 
     # 3. Pull all transfers in block ranges
     all_transfers = []
@@ -471,8 +493,8 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
                 pnl_ratio = realized_profit / realized_cost
                 
         a = agg.WalletAggregate(wallet=wallet, token_address=token_address)
-        a.buy_volume_usd = total_buy_usd
-        a.sell_volume_usd = total_sell_usd
+        a.total_buy_usd = total_buy_usd
+        a.total_sell_usd = total_sell_usd
         a.realized_profit_usd = realized_profit
         a.tags = ["onchain_trader"]
         
@@ -648,13 +670,16 @@ def main():
     scores = scorer.rank_wallets(aggregates)
     print_scores(scores)
 
-    if scores and not args.no_watchlist:
+    # Filter out wallets that do not meet the minimum quality score threshold for the watchlist
+    watchlist_scores = [s for s in scores if s.score >= config.MIN_WATCHLIST_SCORE]
+
+    if watchlist_scores and not args.no_watchlist:
         watchlist_map = wl.upsert(
-            args.watchlist, scores, seed_token=token, stats_period=args.stats_period
+            args.watchlist, watchlist_scores, seed_token=token, stats_period=args.stats_period
         )
         logger.info(
-            "Watchlist updated: +%d scored from this token, %d wallets total -> %s",
-            len(scores), len(watchlist_map), args.watchlist,
+            "Watchlist updated: +%d scored (>= %s) from this token, %d wallets total -> %s",
+            len(watchlist_scores), config.MIN_WATCHLIST_SCORE, len(watchlist_map), args.watchlist,
         )
         
         # Export watchlist to Excel as well

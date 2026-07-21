@@ -96,63 +96,6 @@ def _load_existing_transactions(file_path: str) -> list[dict]:
         return []
 
 
-def _wallet_pnl_rows(events: list[dict]) -> list[dict]:
-    """
-    Combine each wallet's buys and sells per token into one record, then derive cost basis
-    and realized PnL by the average-cost method (from the COMBINED buy/sell, per
-    the request), independent of GMGN's per-sell cost basis:
-
-        avg_buy_price      = total_buy_usd / total_buy_tokens
-        cost_basis_of_sold = avg_buy_price * total_sell_tokens
-        realized_pnl       = total_sell_usd - cost_basis_of_sold
-        realized_pnl_pct   = realized_pnl / cost_basis_of_sold
-
-    Values that can't be computed (e.g. a wallet that sold without any buy in the
-    data, so no average buy price) are left as None rather than a misleading 0.
-    """
-    acc: dict[tuple[str, str], dict] = {}
-    for e in events:
-        w = (e.get("wallet") or "").lower()
-        if not w:
-            continue
-        token_info = e.get("token") or {}
-        token_addr = (token_info.get("address") or "").lower()
-        symbol = token_info.get("symbol") or "TOKEN"
-        side = (e.get("event_type") or e.get("type") or "").lower()
-        cost = _num(e.get("cost_usd")) or 0.0
-        amount = _num(e.get("token_amount")) or 0.0
-        
-        key = (w, token_addr)
-        a = acc.setdefault(key, {
-            "wallet": w, "token_address": token_addr, "symbol": symbol,
-            "buy_count": 0, "buy_usd": 0.0, "buy_tokens": 0.0,
-            "sell_count": 0, "sell_usd": 0.0, "sell_tokens": 0.0,
-        })
-        if side == "buy":
-            a["buy_count"] += 1
-            a["buy_usd"] += cost
-            a["buy_tokens"] += amount
-        elif side == "sell":
-            a["sell_count"] += 1
-            a["sell_usd"] += cost
-            a["sell_tokens"] += amount
-
-    rows = []
-    for a in acc.values():
-        avg_buy_price = a["buy_usd"] / a["buy_tokens"] if a["buy_tokens"] > 0 else None
-        cost_basis_sold = avg_buy_price * a["sell_tokens"] if avg_buy_price is not None else None
-        realized = a["sell_usd"] - cost_basis_sold if cost_basis_sold is not None else None
-        realized_pct = (realized / cost_basis_sold * 100) if (cost_basis_sold and cost_basis_sold > 0) else None
-        rows.append({
-            **a,
-            "avg_buy_price": avg_buy_price,
-            "cost_basis_sold": cost_basis_sold,
-            "realized_pnl": realized,
-            "realized_pnl_pct": realized_pct,
-        })
-    rows.sort(key=lambda r: (r["realized_pnl"] is not None, r["realized_pnl"] or 0), reverse=True)
-    return rows
-
 
 def export_transactions(events: list[dict], output_path: str, raw_events: list[dict] = None):
     """
@@ -238,53 +181,7 @@ def export_transactions(events: list[dict], output_path: str, raw_events: list[d
     ws.column_dimensions["C"].width = 44  # token address
     ws.column_dimensions["I"].width = 68  # tx hash
 
-    # ---------- Wallet PnL tab ----------
-    ws2 = wb.create_sheet("Wallet PnL")
-    headers2 = [
-        "Wallet", "Token Address", "Symbol",
-        "Buy Count", "Total Buy (USD)", "Total Buy (tokens)",
-        "Sell Count", "Total Sell (USD)", "Total Sell (tokens)",
-        "Avg Buy Price (USD)", "Cost Basis of Sold (USD)",
-        "Realized PnL (USD)", "Realized PnL %",
-    ]
-    ws2.append(headers2)
-    _style_header_row(ws2, 1, len(headers2))
 
-    pnl_rows = _wallet_pnl_rows(merged_events)
-    for w in pnl_rows:
-        ws2.append([
-            w["wallet"], w["token_address"], w["symbol"],
-            w["buy_count"], w["buy_usd"], w["buy_tokens"],
-            w["sell_count"], w["sell_usd"], w["sell_tokens"],
-            w["avg_buy_price"], w["cost_basis_sold"],
-            w["realized_pnl"], w["realized_pnl_pct"],
-        ])
-        r = ws2.max_row
-        for c in range(1, len(headers2) + 1):
-            ws2.cell(row=r, column=c).font = BODY_FONT
-        for c in (6, 9):                        # token amounts
-            ws2.cell(row=r, column=c).number_format = "#,##0.########"
-        for c in (5, 8, 11, 12):                # USD columns
-            ws2.cell(row=r, column=c).number_format = "$#,##0.00"
-        ws2.cell(row=r, column=10).number_format = "$#,##0.00000000"  # avg buy price
-        ws2.cell(row=r, column=13).number_format = "0.0"             # pnl %
-
-    for i, header in enumerate(headers2, start=1):
-        ws2.column_dimensions[get_column_letter(i)].width = max(14, len(header) + 2)
-    ws2.column_dimensions["A"].width = 44  # wallet
-    ws2.column_dimensions["B"].width = 44  # token address
-
-    note_row = len(pnl_rows) + 3
-    ws2.cell(
-        row=note_row, column=1,
-        value=(
-            "Note: cost basis and realized PnL use the average-cost method on each "
-            "wallet's COMBINED buys/sells: avg_buy_price = Total Buy USD / Total Buy "
-            "tokens; Cost Basis of Sold = avg_buy_price × Total Sell tokens; Realized "
-            "PnL = Total Sell USD − Cost Basis of Sold. Blank = not computable (e.g. a "
-            "wallet that sold with no buy in the pulled data)."
-        ),
-    ).font = Font(name="Arial", italic=True, size=9, color="808080")
 
     # ---------- Raw Transactions tab ----------
     if raw_events:
@@ -337,31 +234,50 @@ def _load_existing_wallet_summary(file_path: str) -> dict[tuple[str, str], dict]
         if "Wallet Summary" not in wb.sheetnames:
             return {}
         ws = wb["Wallet Summary"]
+        
+        # Read header row to map columns dynamically
+        header_row = [str(cell.value).strip().lower() for cell in ws[1]]
+        
+        def get_val(row, name, default=None):
+            try:
+                idx = header_row.index(name.lower())
+                return row[idx] if idx < len(row) else default
+            except ValueError:
+                return default
+                
         data = {}
         for row in ws.iter_rows(min_row=2, values_only=True):
-            if not row or len(row) < 16:
+            if not row or len(row) < 4:
                 continue
-            wallet, signals, tags, token, buy_usd, sell_usd, net_usd, buy_count, sell_count, profit, profit_change, winrate, wallet_profit, wallet_pnl_ratio, first_trade, last_trade = row[:16]
+                
+            wallet = get_val(row, "Wallet")
+            token = get_val(row, "Token")
             if not wallet or not token:
                 continue
-            key = (wallet.lower(), token.lower())
+                
+            key = (str(wallet).lower(), str(token).lower())
             data[key] = {
                 "wallet": wallet,
-                "signals": signals,
-                "tags": tags,
+                "signals": get_val(row, "Insider Signals", ""),
+                "tags": get_val(row, "Tags", ""),
                 "token": token,
-                "buy_usd": buy_usd,
-                "sell_usd": sell_usd,
-                "net_usd": net_usd,
-                "buy_count": buy_count,
-                "sell_count": sell_count,
-                "profit": profit,
-                "profit_change": profit_change,
-                "winrate": winrate,
-                "wallet_profit": wallet_profit,
-                "wallet_pnl_ratio": wallet_pnl_ratio,
-                "first_trade": first_trade,
-                "last_trade": last_trade,
+                "buy_usd": get_val(row, "Total Buy (USD)"),
+                "sell_usd": get_val(row, "Total Sell (USD)"),
+                "net_usd": get_val(row, "Net (USD)"),
+                "buy_count": get_val(row, "Buy Count"),
+                "sell_count": get_val(row, "Sell Count"),
+                "profit": get_val(row, "Profit (USD)"),
+                "profit_change": get_val(row, "Profit Change %"),
+                "winrate": get_val(row, "Winrate %"),
+                "wallet_profit": get_val(row, "Wallet Profit (period)"),
+                "wallet_volume_usd": get_val(row, "Wallet Volume (USD)"),
+                "wallet_pnl_ratio": get_val(row, "Wallet PnL Ratio"),
+                "wallet_profit_factor": get_val(row, "Wallet Profit Factor"),
+                "wallet_sharpe_ratio": get_val(row, "Wallet Sharpe Ratio"),
+                "wallet_tx_count": get_val(row, "Wallet Tx Count"),
+                "wallet_max_drawdown_ratio": get_val(row, "Wallet Max Drawdown %"),
+                "first_trade": get_val(row, "First Trade (UTC)"),
+                "last_trade": get_val(row, "Last Trade (UTC)"),
             }
         return data
     except Exception as e:
@@ -393,6 +309,7 @@ def export_wallet_report(
         
         profit_change_pct = a.profit_change * 100 if a.profit_change is not None else None
         winrate_pct = a.winrate * 100 if a.winrate is not None else None
+        drawdown_pct = a.wallet_max_drawdown_ratio * 100 if a.wallet_max_drawdown_ratio is not None else None
         
         merged_data[key] = {
             "wallet": a.wallet,
@@ -408,7 +325,12 @@ def export_wallet_report(
             "profit_change": profit_change_pct,
             "winrate": winrate_pct,
             "wallet_profit": a.wallet_realized_profit,
+            "wallet_volume_usd": a.wallet_volume_usd,
             "wallet_pnl_ratio": a.wallet_pnl_ratio,
+            "wallet_profit_factor": a.wallet_profit_factor,
+            "wallet_sharpe_ratio": a.wallet_sharpe_ratio,
+            "wallet_tx_count": a.wallet_tx_count,
+            "wallet_max_drawdown_ratio": drawdown_pct,
             "first_trade": _ts_to_dt(a.first_ts),
             "last_trade": _ts_to_dt(a.last_ts),
         }
@@ -429,8 +351,9 @@ def export_wallet_report(
         "Total Buy (USD)", "Total Sell (USD)", "Net (USD)",
         "Buy Count", "Sell Count",
         "Profit (USD)", "Profit Change %",
-        "Winrate %", "Wallet Profit (period)", "Wallet PnL Ratio",
-        "First Trade (UTC)", "Last Trade (UTC)",
+        "Winrate %", "Wallet Profit (period)", "Wallet Volume (USD)", "Wallet PnL Ratio",
+        "Wallet Profit Factor", "Wallet Sharpe Ratio", "Wallet Tx Count",
+        "Wallet Max Drawdown %", "First Trade (UTC)", "Last Trade (UTC)",
     ]
     ws.append(headers)
     _style_header_row(ws, 1, len(headers))
@@ -450,19 +373,27 @@ def export_wallet_report(
             r_data["profit_change"],
             r_data["winrate"],
             r_data["wallet_profit"],
+            r_data.get("wallet_volume_usd"),
             r_data["wallet_pnl_ratio"],
+            r_data.get("wallet_profit_factor"),
+            r_data.get("wallet_sharpe_ratio"),
+            r_data.get("wallet_tx_count"),
+            r_data.get("wallet_max_drawdown_ratio"),
             r_data["first_trade"],
             r_data["last_trade"],
         ])
         r = ws.max_row
         for c in range(1, len(headers) + 1):
             ws.cell(row=r, column=c).font = BODY_FONT
-        for c in (5, 6, 7, 10, 13):       # USD columns
+        for c in (5, 6, 7, 10, 13, 14):   # USD columns
             ws.cell(row=r, column=c).number_format = "$#,##0"
-        for c in (11, 12):                # percentage columns
+        for c in (11, 12, 19):            # percentage columns
             ws.cell(row=r, column=c).number_format = "0.0"
-        ws.cell(row=r, column=14).number_format = "0.000"        # pnl ratio
-        for c in (15, 16):                # timestamps
+        ws.cell(row=r, column=15).number_format = "0.000"        # pnl ratio
+        ws.cell(row=r, column=16).number_format = "0.00"         # profit factor
+        ws.cell(row=r, column=17).number_format = "0.00"         # Sharpe ratio
+        ws.cell(row=r, column=18).number_format = "#,##0"        # tx count
+        for c in (20, 21):                # timestamps
             ws.cell(row=r, column=c).number_format = "yyyy-mm-dd hh:mm:ss"
 
     for i, header in enumerate(headers, start=1):
@@ -582,8 +513,9 @@ def export_watchlist(watchlist_map: dict[str, dict], output_path: str):
     ws.title = "Watchlist"
     
     headers = [
-        "Wallet", "Score", "Win Rate", "Realized Profit (USD)", "PnL Ratio",
-        "Token Count", "Moonshot Count", "Tags", "Insider Signals", "Seed Tokens", "Last Updated"
+        "Wallet", "Score", "Win Rate", "Realized Profit (USD)", "Volume (USD)", "PnL Ratio",
+        "Token Count", "Moonshot Count", "Max Drawdown %", "Profit Factor", "Sharpe Ratio", "Tx Count",
+        "Tags", "Insider Signals", "Seed Tokens", "Last Updated"
     ]
     ws.append(headers)
     _style_header_row(ws, 1, len(headers))
@@ -593,18 +525,26 @@ def export_watchlist(watchlist_map: dict[str, dict], output_path: str):
     
     for e in sorted_entries:
         winrate = e.get("winrate")
-        # Format winrate to float if present
         if winrate is not None:
             winrate = float(winrate)
+            
+        dd_ratio = e.get("max_drawdown_ratio")
+        if dd_ratio is not None:
+            dd_ratio = float(dd_ratio)
             
         ws.append([
             e.get("wallet"),
             _num(e.get("score")),
             winrate,
             _num(e.get("realized_profit_usd")),
+            _num(e.get("volume_usd")),
             _num(e.get("pnl_ratio")),
             e.get("token_num"),
             e.get("moonshot_count"),
+            dd_ratio,
+            _num(e.get("profit_factor")),
+            _num(e.get("sharpe_ratio")),
+            e.get("tx_count"),
             ", ".join(e.get("tags") or []),
             ", ".join(e.get("insider_signals") or []),
             ", ".join(e.get("seed_tokens") or []),
@@ -616,13 +556,18 @@ def export_watchlist(watchlist_map: dict[str, dict], output_path: str):
         ws.cell(row=r, column=2).number_format = "0.0"
         ws.cell(row=r, column=3).number_format = "0.0%"
         ws.cell(row=r, column=4).number_format = "$#,##0.00"
-        ws.cell(row=r, column=5).number_format = "0.00"
+        ws.cell(row=r, column=5).number_format = "$#,##0.00"
+        ws.cell(row=r, column=6).number_format = "0.00"
+        ws.cell(row=r, column=9).number_format = "0.0%"
+        ws.cell(row=r, column=10).number_format = "0.00"
+        ws.cell(row=r, column=11).number_format = "0.00"
+        ws.cell(row=r, column=12).number_format = "#,##0"
         
     for i, header in enumerate(headers, start=1):
         ws.column_dimensions[get_column_letter(i)].width = max(14, len(header) + 2)
     ws.column_dimensions["A"].width = 44  # wallet
-    ws.column_dimensions["H"].width = 30  # tags
-    ws.column_dimensions["I"].width = 40  # signals
-    ws.column_dimensions["J"].width = 30  # seed tokens
+    ws.column_dimensions["M"].width = 30  # tags
+    ws.column_dimensions["N"].width = 40  # signals
+    ws.column_dimensions["O"].width = 30  # seed tokens
     
     wb.save(output_path)

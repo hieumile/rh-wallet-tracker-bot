@@ -57,6 +57,11 @@ class WalletAggregate:
     wallet_token_num: int | None = None           # distinct tokens traded (anti-luck)
     wallet_moonshot_count: int | None = None      # trades that returned > 2x
     wallet_avg_holding_secs: float | None = None
+    wallet_max_drawdown_ratio: float | None = None # calculated from activity
+    wallet_volume_usd: float | None = None        # total traded volume (USD)
+    wallet_tx_count: int | None = None            # total transactions (buys + sells)
+    wallet_profit_factor: float | None = None     # gross profits / gross losses
+    wallet_sharpe_ratio: float | None = None      # risk-adjusted return ratio
     stats_period: str | None = None
 
     first_ts: int | None = None
@@ -216,6 +221,19 @@ def apply_stats(agg: WalletAggregate, stats: dict) -> WalletAggregate:
         agg.wallet_pnl_ratio = _f(stats.get("realized_profit_pnl"))
     if pnl_stat.get("token_num") is not None:
         agg.wallet_token_num = int(_f(pnl_stat.get("token_num")) or 0)
+    
+    # Calculate trading volume
+    b_cost = _f(stats.get("bought_cost"))
+    s_income = _f(stats.get("sold_income"))
+    if b_cost is not None or s_income is not None:
+        agg.wallet_volume_usd = (b_cost or 0.0) + (s_income or 0.0)
+        
+    # Calculate transaction count
+    buy_cnt = _f(stats.get("buy"))
+    sell_cnt = _f(stats.get("sell"))
+    if buy_cnt is not None or sell_cnt is not None:
+        agg.wallet_tx_count = int((buy_cnt or 0) + (sell_cnt or 0))
+
     # moonshots = trades that returned more than 2x (2x-5x plus >5x buckets)
     moon = _f(pnl_stat.get("pnl_2x_5x_num"))
     moon5 = _f(pnl_stat.get("pnl_gt_5x_num"))
