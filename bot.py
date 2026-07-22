@@ -109,9 +109,37 @@ def _format_windows(window_args: list) -> list[str]:
     return formatted_args
 
 
+def _get_token_identifier(token_input: str, resolved_address: str) -> str:
+    """Return a clean, safe filename identifier for the token (e.g. 'pons' or '0x39dbed3a')."""
+    token_lower = token_input.lower().strip()
+    
+    # 1. If input was a known alias, return it
+    if token_lower in COMMON_ALIASES:
+        return token_lower
+        
+    # 2. Check reverse mapping in COMMON_ALIASES
+    for alias, addr in COMMON_ALIASES.items():
+        if addr.lower() == resolved_address.lower():
+            return alias
+            
+    # 3. Try to get symbol from DEX Screener
+    try:
+        pair = dex.get_primary_pair(resolved_address)
+        if pair and pair.get("baseToken"):
+            symbol = pair["baseToken"].get("symbol", "").lower().strip()
+            if symbol and symbol.isalnum():
+                return symbol
+    except Exception:
+        pass
+        
+    # Fallback to short address
+    return resolved_address[:10].lower()
+
+
 def run_scan(args, extra_args):
     """Normalize scanner arguments and execute main.py."""
     token = _resolve_token(args.token)
+    token_id = _get_token_identifier(args.token, token)
     
     # Construct base sys.argv for main.py
     sys_args = ["main.py", token]
@@ -122,6 +150,8 @@ def run_scan(args, extra_args):
         
     if args.onchain:
         sys_args.append("--onchain")
+    if args.gmgn:
+        sys_args.append("--gmgn")
     if args.all:
         sys_args.append("--all")
     if args.tag:
@@ -129,9 +159,12 @@ def run_scan(args, extra_args):
     if args.limit:
         sys_args.extend(["--limit", str(args.limit)])
         
-    # Append smart defaults for export paths
-    sys_args.extend(["--txns", args.txns])
-    sys_args.extend(["--export", args.export])
+    # Append smart defaults for token-specific export paths
+    txns_path = args.txns if args.txns != "transactions.xlsx" else f"transactions_{token_id}.xlsx"
+    export_path = args.export if args.export != "wallet_summary.xlsx" else f"wallet_summary_{token_id}.xlsx"
+    
+    sys_args.extend(["--txns", txns_path])
+    sys_args.extend(["--export", export_path])
     
     # Append any unparsed CLI arguments directly
     sys_args.extend(extra_args)
@@ -171,6 +204,61 @@ def run_watch(args, extra_args):
     main_signals.main()
 
 
+def run_remove(args):
+    """Remove one or more wallets from the watchlist and sync with Excel."""
+    import json
+    from export_xlxs import export_watchlist
+    
+    watchlist_path = args.watchlist
+    if not os.path.exists(watchlist_path):
+        print(f"Error: Watchlist file not found at '{watchlist_path}'")
+        sys.exit(1)
+        
+    with open(watchlist_path, "r") as f:
+        try:
+            data = json.load(f)
+        except Exception as e:
+            print(f"Error reading watchlist: {e}")
+            sys.exit(1)
+            
+    initial_count = len(data)
+    remove_targets = {w.lower().strip() for w in args.wallets}
+    
+    # Filter out matching wallets
+    cleaned = [e for e in data if e.get("wallet", "").lower().strip() not in remove_targets]
+    removed_count = initial_count - len(cleaned)
+    
+    if removed_count == 0:
+        print("No matching wallets found in the watchlist. No changes made.")
+        return
+        
+    # Save watchlist.json
+    with open(watchlist_path, "w") as f:
+        json.dump(cleaned, f, indent=2)
+        
+    # Sync with watchlist.xlsx
+    excel_path = watchlist_path.replace(".json", ".xlsx")
+    try:
+        watchlist_map = {e["wallet"]: e for e in cleaned}
+        export_watchlist(watchlist_map, excel_path)
+        excel_msg = f" and synchronized {excel_path}"
+        
+        # Auto-open/reload the updated Excel file
+        import subprocess
+        abs_path = os.path.abspath(excel_path)
+        if sys.platform == "darwin":
+            subprocess.run(["open", abs_path], check=True)
+        elif sys.platform.startswith("win"):
+            os.startfile(abs_path)
+        else:
+            subprocess.run(["xdg-open", abs_path], check=True)
+    except Exception as e:
+        excel_msg = f" (failed to sync/open Excel: {e})"
+        
+    print(f"Successfully removed {removed_count} wallet(s) from watchlist{excel_msg}.")
+    print(f"Remaining wallets: {len(cleaned)}.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Unified CLI interface for Robinhood Chain Wallet Tracker Bot."
@@ -184,7 +272,8 @@ def main():
         "--window", nargs="+", action="append", metavar="WINDOW",
         help="Shorthand time window. Relative (e.g. 24h, 7d) or exact (e.g. '07/07 19:00' '08/07 13:00')"
     )
-    scan_parser.add_argument("--onchain", action="store_true", help="Ingest directly from Blockscout chain logs.")
+    scan_parser.add_argument("--onchain", action="store_true", help="Legacy flag (on-chain is default).")
+    scan_parser.add_argument("--gmgn", action="store_true", help="Use GMGN top traders database instead of direct on-chain scan.")
     scan_parser.add_argument("--all", action="store_true", help="Scan all traders, bypass tag filters.")
     scan_parser.add_argument("--tag", help="GMGN tag filter.")
     scan_parser.add_argument("--limit", type=int, default=50, help="Max candidates to pull per tag.")
@@ -199,6 +288,11 @@ def main():
     watch_parser.add_argument("--limit-pages", type=int, default=2, help="Max history pages to scan per wallet.")
     watch_parser.add_argument("--force", action="store_true", help="Ignore saved cursor state and scan fresh.")
     
+    # Subcommand: remove
+    remove_parser = subparsers.add_parser("remove", help="Remove one or more wallets from the watchlist.")
+    remove_parser.add_argument("wallets", nargs="+", help="Wallet addresses (0x...) to remove.")
+    remove_parser.add_argument("--watchlist", default="watchlist.json", help="Path to watchlist file.")
+    
     # Parse defined arguments, leaving extra unparsed args to be forwarded
     args, extra_args = parser.parse_known_args()
     
@@ -206,6 +300,8 @@ def main():
         run_scan(args, extra_args)
     elif args.command == "watch":
         run_watch(args, extra_args)
+    elif args.command == "remove":
+        run_remove(args)
 
 
 if __name__ == "__main__":

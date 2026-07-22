@@ -76,7 +76,6 @@ INSIDER_TAGS = ["rat_trader", "smart_degen", "sniper"]
 # track record (from GMGN wallet_stats over STATS_PERIOD), not its record on
 # the single seed token — the seed token only supplies the candidate pool.
 STATS_PERIOD = "30d"             # wallet_stats window: "7d" or "30d"
-MIN_TOKEN_NUM = 3                # exclude one/two-hit wonders (too little history)
 MIN_REALIZED_PROFIT_USD = 100.0  # must make at least $100 net profit over the period
 MIN_VOLUME_USD = 500.0           # must trade at least $500 total volume to ensure active trading
 MIN_WINRATE = 0.50               # require at least 50% winrate to avoid lucky gamblers
@@ -97,14 +96,12 @@ SCORE_WEIGHTS = {
     "pnl_ratio": 10,    # realized_profit / total_cost
     "profit": 15,       # absolute realized profit (log-scaled)
     "volume": 10,       # overall trading volume (log-scaled)
-    "profit_factor": 15, # gross profit / gross loss
-    "sharpe": 10,       # risk-adjusted return ratio
+    "profit_factor": 20, # gross profit / gross loss (increased from 15)
+    "sharpe": 15,       # risk-adjusted return ratio (increased from 10)
     "drawdown": 10,     # control of maximum asset drawdown from peak
     "moonshot": 10,     # share of trades that returned > 2x
-    "experience": 10,   # number of distinct tokens traded (anti-luck)
 }
 PROFIT_FULL_SCORE_USD = 100_000  # realized profit that maxes the profit component
-EXPERIENCE_FULL_TOKENS = 30      # token_num that maxes the experience component
 
 # Persisted output that Subsystem 3 (signal generator) will consume.
 WATCHLIST_PATH = "watchlist.json"

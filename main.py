@@ -162,8 +162,11 @@ def enrich_with_activity(
         recomputed = agg.aggregate_activity(
             a.wallet, events, token_address=token_address, windows=windows,
         )
-        if drop_empty and recomputed.buy_count == 0 and recomputed.sell_count == 0:
-            continue
+        if drop_empty:
+            if recomputed.buy_count == 0 and recomputed.sell_count == 0:
+                continue
+            if recomputed.total_buy_tokens <= recomputed.total_sell_tokens:
+                continue
 
         a.total_buy_usd = recomputed.total_buy_usd
         a.total_sell_usd = recomputed.total_sell_usd
@@ -246,7 +249,7 @@ def print_scores(scores: list[scorer.WalletScore]) -> None:
         )
     if not scores:
         print("No wallets cleared the follow-worthiness filters "
-              f"(min {config.MIN_TOKEN_NUM} tokens, profit >= ${config.MIN_REALIZED_PROFIT_USD:,.0f}).")
+              f"(profit >= ${config.MIN_REALIZED_PROFIT_USD:,.0f}, volume >= ${config.MIN_VOLUME_USD:,.0f}).")
 
 
 # Accepted date/time inputs (all interpreted as UTC). Slash form is day-first
@@ -477,6 +480,11 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
         total_buy_tokens = sum(t["token_amount"] for t in buys)
         total_sell_tokens = sum(t["token_amount"] for t in sells)
         
+        # Target only wallets with a net buy (holding) position in this window
+        net_tokens = total_buy_tokens - total_sell_tokens
+        if net_tokens <= 0:
+            continue
+            
         realized_profit = 0.0
         pnl_ratio = 0.0
         if total_buy_tokens > 0:
@@ -532,7 +540,8 @@ def main():
     parser.add_argument("--txns", metavar="PATH", help="Dump raw ingested transactions (one row per buy/sell) to an .xlsx file — for testing ingestion.")
     parser.add_argument("--watchlist", metavar="PATH", default=config.WATCHLIST_PATH, help="Merge scored wallets into this JSON watchlist (Subsystem 3 input).")
     parser.add_argument("--no-watchlist", action="store_true", help="Score and print but do not write the watchlist file.")
-    parser.add_argument("--onchain", action="store_true", help="Ingest all transfers on-chain via Blockscout directly instead of GMGN.")
+    parser.add_argument("--onchain", action="store_true", help="Legacy flag (on-chain is default).")
+    parser.add_argument("--gmgn", action="store_true", help="Use GMGN top traders database instead of direct on-chain RPC scan.")
     args = parser.parse_args()
 
     if not config.GMGN_API_KEY:
@@ -548,11 +557,8 @@ def main():
 
     token = args.token_address
     raw_trades = []
-    if args.onchain:
-        aggregates, trades, raw_trades = build_onchain_aggregates(token, windows, limit=args.limit)
-        tags = ["onchain_trader"]
-    else:
-        # Discovery: which tag(s) to pull.
+    if args.gmgn:
+        # Discovery: GMGN top traders mode
         if args.all:
             tags = [None]
         elif args.tag:
@@ -573,6 +579,10 @@ def main():
 
         aggregates = list(merged.values())
         logger.info("%d unique wallets across tag(s) %s", len(aggregates), tags)
+    else:
+        # Default mode: Direct On-Chain RPC Ingestion
+        aggregates, trades, raw_trades = build_onchain_aggregates(token, windows, limit=args.limit)
+        tags = ["onchain_trader"]
 
     # Pre-filter: enrich with stats and drop MEV/non-qualifying wallets early.
     # This prevents downloading transactions or writing reports for sandwich/MEV bots.
@@ -598,7 +608,7 @@ def main():
     if args.txns:
         from export_xlxs import export_transactions
         raw_events = None
-        if args.onchain:
+        if not args.gmgn:
             # Fetch actual token symbol from DEX Screener
             token_symbol = "TOKEN"
             try:

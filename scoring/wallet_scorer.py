@@ -186,10 +186,6 @@ def _score_components(agg: WalletAggregate) -> dict[str, float]:
     else:
         moonshot_component = 0.0
 
-    tagset = {t.lower() for t in agg.tags}
-    is_fresh = "fresh_wallet" in tagset
-    experience_component = 1.0 if is_fresh else _clamp01(token_num / config.EXPERIENCE_FULL_TOKENS)
-
     # Drawdown component: (1.0 - drawdown_ratio) clamped to 0..1
     dd_ratio = agg.wallet_max_drawdown_ratio or 0.0
     drawdown_component = _clamp01(1.0 - dd_ratio)
@@ -203,7 +199,6 @@ def _score_components(agg: WalletAggregate) -> dict[str, float]:
         "sharpe": sharpe_component,
         "drawdown": drawdown_component,
         "moonshot": moonshot_component,
-        "experience": experience_component,
     }
 
 
@@ -221,10 +216,6 @@ def _passes_filters(agg: WalletAggregate) -> bool:
         return False
 
     # 2. History & Profit Filters
-    is_fresh = "fresh_wallet" in tagset
-    if not is_fresh and (agg.wallet_token_num or 0) < config.MIN_TOKEN_NUM:
-        return False
-        
     if (agg.wallet_realized_profit or 0.0) < config.MIN_REALIZED_PROFIT_USD:
         return False
     if (agg.winrate or 0.0) < config.MIN_WINRATE:

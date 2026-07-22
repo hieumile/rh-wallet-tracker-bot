@@ -49,6 +49,42 @@ def load(path: str) -> dict[str, dict]:
     return {}
 
 
+def _resolve_seed_token_name(seed_token: str | None) -> str | None:
+    """Resolve seed token address or symbol into an uppercase token name (e.g. PONS, NOCK)."""
+    if not seed_token:
+        return None
+    token_str = str(seed_token).strip()
+    if not token_str:
+        return None
+
+    # Check aliases
+    try:
+        from bot import COMMON_ALIASES
+        token_lower = token_str.lower()
+        if token_lower in COMMON_ALIASES:
+            return token_lower.upper()
+
+        for alias, addr in COMMON_ALIASES.items():
+            if addr.lower() == token_lower:
+                return alias.upper()
+    except Exception:
+        pass
+
+    # Try DEX Screener lookup if hex address
+    if token_str.startswith("0x") and len(token_str) == 42:
+        try:
+            from ingestion import dexscreener_client as dex
+            pair = dex.get_primary_pair(token_str)
+            if pair and pair.get("baseToken"):
+                sym = pair["baseToken"].get("symbol")
+                if sym:
+                    return sym.upper()
+        except Exception:
+            pass
+
+    return token_str.upper()
+
+
 def upsert(
     path: str,
     scores: list[WalletScore],
@@ -61,12 +97,15 @@ def upsert(
     """
     existing = load(path)
     now = _now_iso()
+    seed_name = _resolve_seed_token_name(seed_token)
 
     for s in scores:
         prev = existing.get(s.wallet)
-        seeds = set(prev.get("seed_tokens", [])) if prev else set()
-        if seed_token:
-            seeds.add(seed_token)
+        raw_prev_seeds = prev.get("seed_tokens", []) if prev else []
+        prev_seeds = [ _resolve_seed_token_name(st) or st for st in raw_prev_seeds ]
+        seeds = set(prev_seeds)
+        if seed_name:
+            seeds.add(seed_name)
 
         existing[s.wallet] = {
             "wallet": s.wallet,
