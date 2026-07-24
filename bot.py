@@ -13,6 +13,7 @@ import sys
 import os
 import argparse
 from datetime import datetime, timedelta, timezone
+import config
 
 # Add current folder to path to make imports work from anywhere
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -158,10 +159,12 @@ def run_scan(args, extra_args):
         sys_args.extend(["--tag", args.tag])
     if args.limit:
         sys_args.extend(["--limit", str(args.limit)])
+    if args.tx_limit:
+        sys_args.extend(["--tx-limit", str(args.tx_limit)])
         
     # Append smart defaults for token-specific export paths
-    txns_path = args.txns if args.txns != "transactions.xlsx" else f"transactions_{token_id}.xlsx"
-    export_path = args.export if args.export != "wallet_summary.xlsx" else f"wallet_summary_{token_id}.xlsx"
+    txns_path = args.txns if args.txns != "transactions.xlsx" else f"output/transactions_{token_id}.xlsx"
+    export_path = args.export if args.export != "wallet_summary.xlsx" else f"output/wallet_summary_{token_id}.xlsx"
     
     sys_args.extend(["--txns", txns_path])
     sys_args.extend(["--export", export_path])
@@ -277,13 +280,14 @@ def main():
     scan_parser.add_argument("--all", action="store_true", help="Scan all traders, bypass tag filters.")
     scan_parser.add_argument("--tag", help="GMGN tag filter.")
     scan_parser.add_argument("--limit", type=int, default=50, help="Max candidates to pull per tag.")
+    scan_parser.add_argument("--tx-limit", type=int, default=config.MAX_ONCHAIN_TRANSACTIONS, help=f"Max unique transactions to process on-chain (default: {config.MAX_ONCHAIN_TRANSACTIONS}).")
     scan_parser.add_argument("--txns", default="transactions.xlsx", help="Export path for raw transactions database.")
     scan_parser.add_argument("--export", default="wallet_summary.xlsx", help="Export path for wallet rankings.")
     
     # Subcommand: watch
     watch_parser = subparsers.add_parser("watch", help="Watch live transaction signals from watchlist.")
     watch_parser.add_argument("--min-score", type=float, default=30.0, help="Minimum wallet score to watch.")
-    watch_parser.add_argument("--export", default="signals.xlsx", help="Export path for signal logs.")
+    watch_parser.add_argument("--export", default="output/signals.xlsx", help="Export path for signal logs.")
     watch_parser.add_argument("--co-only", action="store_true", help="Only show co-investment alerts.")
     watch_parser.add_argument("--limit-pages", type=int, default=2, help="Max history pages to scan per wallet.")
     watch_parser.add_argument("--force", action="store_true", help="Ignore saved cursor state and scan fresh.")
@@ -291,7 +295,7 @@ def main():
     # Subcommand: remove
     remove_parser = subparsers.add_parser("remove", help="Remove one or more wallets from the watchlist.")
     remove_parser.add_argument("wallets", nargs="+", help="Wallet addresses (0x...) to remove.")
-    remove_parser.add_argument("--watchlist", default="watchlist.json", help="Path to watchlist file.")
+    remove_parser.add_argument("--watchlist", default="output/watchlist.json", help="Path to watchlist file.")
     
     # Parse defined arguments, leaving extra unparsed args to be forwarded
     args, extra_args = parser.parse_known_args()

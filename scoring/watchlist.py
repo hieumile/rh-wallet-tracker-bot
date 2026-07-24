@@ -169,9 +169,12 @@ def upsert(
                 pass
 
     ranked = sorted(existing.values(), key=lambda e: e.get("score", 0), reverse=True)
+    parent_dir = os.path.dirname(path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
     tmp = f"{path}.tmp"
     with open(tmp, "w") as f:
         json.dump(ranked, f, indent=2)
-    os.replace(tmp, path)  # atomic write so a crash can't corrupt the watchlist
+    os.replace(tmp, path)
 
     return {e["wallet"]: e for e in ranked}

@@ -223,6 +223,9 @@ def export_transactions(events: list[dict], output_path: str, raw_events: list[d
         ws3.column_dimensions["H"].width = 68  # tx hash
         ws3.column_dimensions["I"].width = 28  # status / reason
 
+    parent_dir = os.path.dirname(output_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
     wb.save(output_path)
 
 
@@ -417,6 +420,9 @@ def export_wallet_report(
         ),
     ).font = Font(name="Arial", italic=True, size=9, color="808080")
 
+    parent_dir = os.path.dirname(output_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
     wb.save(output_path)
 
 
@@ -501,6 +507,9 @@ def export_signals_report(signals: list[dict], co_investments: list[dict], outpu
     ws2.column_dimensions["C"].width = 44  # token address
     ws2.column_dimensions["G"].width = 80  # buyers string
 
+    parent_dir = os.path.dirname(output_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
     wb.save(output_path)
 
 
@@ -570,4 +579,7 @@ def export_watchlist(watchlist_map: dict[str, dict], output_path: str):
     ws.column_dimensions["N"].width = 40  # signals
     ws.column_dimensions["O"].width = 30  # seed tokens
     
+    parent_dir = os.path.dirname(output_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
     wb.save(output_path)

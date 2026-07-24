@@ -78,15 +78,19 @@ INSIDER_TAGS = ["rat_trader", "smart_degen", "sniper"]
 STATS_PERIOD = "30d"             # wallet_stats window: "7d" or "30d"
 MIN_REALIZED_PROFIT_USD = 100.0  # must make at least $100 net profit over the period
 MIN_VOLUME_USD = 500.0           # must trade at least $500 total volume to ensure active trading
-MIN_WINRATE = 0.50               # require at least 50% winrate to avoid lucky gamblers
+MIN_WINRATE = 0.40               # require at least 40% winrate to avoid lucky gamblers
 MIN_HOLDING_TIME_SECS = 60       # discard high-frequency MEV/sandwich bots (under 1m hold)
 EXCLUDE_TAGS = {"sandwich_bot", "uniswap_v3_multicall"}
 MAX_DRAWDOWN_RATIO_LIMIT = 0.60  # exclude wallets with max drawdown > 60% of peak profit
-MAX_TX_COUNT = 300               # exclude wallets with > 300 transactions in period (trading bots)
+MAX_TX_COUNT = 500               # exclude wallets with > 500 transactions in period (trading bots)
 MIN_WATCHLIST_SCORE = 40.0       # minimum composite score required to enter the watchlist
 PROFIT_FACTOR_CAP = 2.0          # profit factor that maxes the profit_factor component
 SHARPE_CAP = 1.5                 # Sharpe ratio that maxes the sharpe component
 VOLUME_FULL_SCORE_USD = 200_000  # trading volume (USD) that maxes the volume component
+
+# Ingestion Settings
+MAX_ONCHAIN_TRANSACTIONS = 2000  # default cap on unique transactions processed on-chain
+MIN_WALLET_AGE_DAYS = 2.0        # only follow wallets that are at least 2 days old (filters fresh burners)
 
 
 # Composite score weights (points out of 100). Each component is normalized to
@@ -104,7 +108,7 @@ SCORE_WEIGHTS = {
 PROFIT_FULL_SCORE_USD = 100_000  # realized profit that maxes the profit component
 
 # Persisted output that Subsystem 3 (signal generator) will consume.
-WATCHLIST_PATH = "watchlist.json"
+WATCHLIST_PATH = "output/watchlist.json"
 
 # --- Subsystem 3 (Signal Generator) ---
 # Common quote tokens on Robinhood Chain (in lowercase) to ignore as target assets
@@ -112,7 +116,7 @@ QUOTE_TOKENS = {
     "0x0bd7d308f8e1639fab988df18a8011f41eacad73": "WETH",
 }
 SIGNAL_LOOKBACK_HOURS = 24
-SIGNAL_STATE_PATH = "signal_state.json"
+SIGNAL_STATE_PATH = "output/signal_state.json"
 MIN_SIGNAL_BUY_USD = 100.0  # Discard buys below this USD size (lottery tickets)
 MIN_CO_BUYERS = 2           # Minimum unique buyers required to flag a Co-Investment
 MIN_NET_ACCUMULATION_RATIO = 2.0  # Buying USD must be at least this multiple of selling USD

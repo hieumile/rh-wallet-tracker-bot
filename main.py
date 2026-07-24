@@ -299,7 +299,7 @@ def _build_windows(args) -> list[tuple[int | None, int | None]]:
             _parse_dt(args.date_to, end=True) if args.date_to else None,
         ))
     return windows
-def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None, int | None]], limit: int = 50) -> tuple[list[agg.WalletAggregate], list[dict]]:
+def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None, int | None]], limit: int = 50, tx_limit: int = 1000) -> tuple[list[agg.WalletAggregate], list[dict], list[dict]]:
     """
     Fetch raw transfers from Blockscout, classify swaps against the pool,
     reconstruct prices, calculate local wallet PnL, and return (aggregates, raw_trades).
@@ -326,10 +326,12 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
             block_ranges.append((s_blk, e_blk))
             
     # 2. Get Uniswap Pair address
+    pairs = dex.get_pairs_for_token(token_address)
+    pool_addresses = {p.get("pairAddress", "").lower() for p in pairs if p.get("pairAddress")}
     pair_address = dex.get_primary_pair(token_address)
     pool_addr = pair_address.get("pairAddress", "").lower() if pair_address else ""
-    if not pool_addr:
-        logger.warning("Could not find DEX pair for token %s. On-chain classification might fail.", token_address)
+    if not pool_addresses:
+        logger.warning("Could not find any DEX pairs for token %s. On-chain classification might fail.", token_address)
         
     # Get current WETH price to help with USD value estimation
     weth_price = 3000.0  # fallback
@@ -341,22 +343,21 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
             weth_price = float(pair_data.get("priceUsd"))
     except Exception as e:
         logger.warning("Could not fetch global WETH price: %s", e)
-
-    # 3. Pull all transfers in block ranges
+        
+    # 3. Retrieve raw transfers
     all_transfers = []
     for s_blk, e_blk in block_ranges:
-        logger.info("Fetching on-chain transfers for token from block %d to %d...", s_blk, e_blk)
         try:
-            transfers = bs.get_token_transfers(token_address, s_blk, e_blk)
+            transfers = bs.get_token_transfers(token_address, start_block=s_blk, end_block=e_blk)
             all_transfers.extend(transfers)
         except Exception as e:
-            logger.error("Failed to fetch transfers: %s", e)
+            logger.error("Failed to fetch transfers for block range %d-%d: %s", s_blk, e_blk, e)
             
-    logger.info("Found %d raw transfers on-chain.", len(all_transfers))
     if not all_transfers:
+        logger.warning("No raw transfers found on-chain.")
         return [], [], []
         
-    # 4. Group transfers by transaction hash to classify trades
+    # 4. Group transfers by transaction hash
     tx_groups = {}
     for t in all_transfers:
         tx_hash = t.get("transaction_hash")
@@ -369,9 +370,9 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
     processed_count = 0
     
     # Cap processing to avoid rate limiting
-    tx_hashes = list(tx_groups.keys())[:1000]
-    if len(tx_groups) > 1000:
-        logger.warning("Capping scan at 1000 transactions to avoid rate limit throttling.")
+    tx_hashes = list(tx_groups.keys())[:tx_limit]
+    if len(tx_groups) > tx_limit:
+        logger.warning("Capping scan at %d transactions to avoid rate limit throttling.", tx_limit)
         
     capped_set = set(tx_hashes)
         
@@ -396,10 +397,10 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
             
             side = None
             wallet = None
-            if from_hash == pool_addr:
+            if from_hash in pool_addresses:
                 side = "buy"
                 wallet = to_hash
-            elif to_hash == pool_addr:
+            elif to_hash in pool_addresses:
                 side = "sell"
                 wallet = from_hash
                 
@@ -408,7 +409,7 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
                 status = "CAPPED_LIMIT_EXCEEDED"
             elif amount <= 0.0:
                 status = "ZERO_VALUE_SPAM"
-            elif not side or wallet == pool_addr or not wallet:
+            elif not side or wallet in pool_addresses or not wallet:
                 status = "NON_TRADE_TRANSFER"
             else:
                 status = "PENDING"
@@ -503,6 +504,10 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
         a = agg.WalletAggregate(wallet=wallet, token_address=token_address)
         a.total_buy_usd = total_buy_usd
         a.total_sell_usd = total_sell_usd
+        a.total_buy_tokens = total_buy_tokens
+        a.total_sell_tokens = total_sell_tokens
+        a.buy_count = len(buys)
+        a.sell_count = len(sells)
         a.realized_profit_usd = realized_profit
         a.tags = ["onchain_trader"]
         
@@ -542,6 +547,7 @@ def main():
     parser.add_argument("--no-watchlist", action="store_true", help="Score and print but do not write the watchlist file.")
     parser.add_argument("--onchain", action="store_true", help="Legacy flag (on-chain is default).")
     parser.add_argument("--gmgn", action="store_true", help="Use GMGN top traders database instead of direct on-chain RPC scan.")
+    parser.add_argument("--tx-limit", type=int, default=config.MAX_ONCHAIN_TRANSACTIONS, help="Max unique transactions to process in on-chain mode.")
     args = parser.parse_args()
 
     if not config.GMGN_API_KEY:
@@ -581,7 +587,7 @@ def main():
         logger.info("%d unique wallets across tag(s) %s", len(aggregates), tags)
     else:
         # Default mode: Direct On-Chain RPC Ingestion
-        aggregates, trades, raw_trades = build_onchain_aggregates(token, windows, limit=args.limit)
+        aggregates, trades, raw_trades = build_onchain_aggregates(token, windows, limit=args.limit, tx_limit=args.tx_limit)
         tags = ["onchain_trader"]
 
     # Pre-filter: enrich with stats and drop MEV/non-qualifying wallets early.
@@ -597,12 +603,14 @@ def main():
 
     # In windowed mode (GMGN path), per-token buy/sell/profit MUST come from activity within
     # the window(s) (the trader summary is all-time). Drop wallets inactive then.
-    if not args.onchain and (windowed or args.activity):
+    if args.gmgn and (windowed or args.activity):
         aggregates = enrich_with_activity(
             aggregates, token, windows=windows, drop_empty=windowed
         )
         if windowed:
             logger.info("%d wallets active in the window(s)", len(aggregates))
+    elif not args.gmgn and windowed:
+        logger.info("%d wallets active in the window(s)", len(aggregates))
 
     # Raw ingestion dump: one row per transaction (independent of scoring).
     if args.txns:
