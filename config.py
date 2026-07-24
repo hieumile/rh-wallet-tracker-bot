@@ -97,10 +97,10 @@ MIN_WALLET_AGE_DAYS = 2.0        # only follow wallets that are at least 2 days 
 # 0..1 then multiplied by its weight; see scoring/wallet_scorer.py.
 SCORE_WEIGHTS = {
     "winrate": 10,      # ratio of profitable trades
-    "pnl_ratio": 10,    # realized_profit / total_cost
+    "pnl_ratio": 15,    # realized_profit / total_cost
     "profit": 15,       # absolute realized profit (log-scaled)
     "volume": 10,       # overall trading volume (log-scaled)
-    "profit_factor": 20, # gross profit / gross loss (increased from 15)
+    "profit_factor": 15, # gross profit / gross loss (increased from 15)
     "sharpe": 15,       # risk-adjusted return ratio (increased from 10)
     "drawdown": 10,     # control of maximum asset drawdown from peak
     "moonshot": 10,     # share of trades that returned > 2x
