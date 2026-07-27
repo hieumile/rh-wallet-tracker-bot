@@ -91,19 +91,20 @@ VOLUME_FULL_SCORE_USD = 200_000  # trading volume (USD) that maxes the volume co
 # Ingestion Settings
 MAX_ONCHAIN_TRANSACTIONS = 2000  # default cap on unique transactions processed on-chain
 MIN_WALLET_AGE_DAYS = 2.0        # only follow wallets that are at least 2 days old (filters fresh burners)
+RPC_MAX_WORKERS = 8              # max concurrent threads for fetching transaction receipts
 
 
 # Composite score weights (points out of 100). Each component is normalized to
 # 0..1 then multiplied by its weight; see scoring/wallet_scorer.py.
 SCORE_WEIGHTS = {
     "winrate": 10,      # ratio of profitable trades
-    "pnl_ratio": 15,    # realized_profit / total_cost
-    "profit": 15,       # absolute realized profit (log-scaled)
-    "volume": 10,       # overall trading volume (log-scaled)
-    "profit_factor": 15, # gross profit / gross loss (increased from 15)
-    "sharpe": 15,       # risk-adjusted return ratio (increased from 10)
+    "pnl_ratio": 10,    # realized_profit / total_cost
+    "profit": 25,       # absolute realized profit (log-scaled)
+    "volume": 20,       # overall trading volume (log-scaled)
+    "profit_factor": 10, # gross profit / gross loss (increased from 15)
+    "sharpe": 10,       # risk-adjusted return ratio (increased from 10)
     "drawdown": 10,     # control of maximum asset drawdown from peak
-    "moonshot": 10,     # share of trades that returned > 2x
+    "moonshot": 5,      # share of trades that returned > 2x
 }
 PROFIT_FULL_SCORE_USD = 100_000  # realized profit that maxes the profit component
 

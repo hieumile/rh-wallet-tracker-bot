@@ -218,63 +218,9 @@ def _passes_filters(agg: WalletAggregate) -> bool:
     if agg.wallet_avg_holding_secs is not None and agg.wallet_avg_holding_secs < config.MIN_HOLDING_TIME_SECS:
         return False
 
-    # 2. History & Profit Filters
-    if (agg.wallet_realized_profit or 0.0) < config.MIN_REALIZED_PROFIT_USD:
-        return False
-    if (agg.winrate or 0.0) < config.MIN_WINRATE:
-        return False
-
-    # 3. Drawdown Limit Filter
-    if agg.wallet_max_drawdown_ratio is not None and agg.wallet_max_drawdown_ratio > config.MAX_DRAWDOWN_RATIO_LIMIT:
-        return False
-
-    # 4. Bot transaction count filter
+    # 2. Bot transaction count filter
     if agg.wallet_tx_count is not None and agg.wallet_tx_count > config.MAX_TX_COUNT:
         return False
-
-    # 5. Volume floor filter (ensures active trading history)
-    if agg.wallet_volume_usd is not None and agg.wallet_volume_usd < config.MIN_VOLUME_USD:
-        return False
-
-    # 6. Wallet Age Filter (at least 3 days old)
-    if hasattr(config, "MIN_WALLET_AGE_DAYS") and config.MIN_WALLET_AGE_DAYS > 0:
-        from ingestion import blockscout_client as bs
-        from datetime import datetime, timezone
-        try:
-            path = f"/addresses/{agg.wallet}/transactions"
-            params = {}
-            is_old_enough = False
-            for _ in range(5):  # paginate up to 5 pages max to find oldest txn
-                d = bs._get(path, params=params)
-                items = d.get("items", [])
-                if not items:
-                    break
-                
-                # Check if any transaction on the current page is older than the limit
-                now = datetime.now(timezone.utc)
-                has_older_tx = False
-                for tx in items:
-                    if tx.get("timestamp"):
-                        dt = datetime.fromisoformat(tx["timestamp"].replace("Z", "+00:00"))
-                        age = (now - dt).total_seconds() / 86400.0
-                        if age >= config.MIN_WALLET_AGE_DAYS:
-                            has_older_tx = True
-                            break
-                
-                if has_older_tx:
-                    is_old_enough = True
-                    break
-                
-                next_params = d.get("next_page_params")
-                if not next_params:
-                    break
-                params = next_params
-                
-            if not is_old_enough:
-                logger.info("Dropping wallet %s: younger than %s days", agg.wallet, config.MIN_WALLET_AGE_DAYS)
-                return False
-        except Exception as e:
-            logger.warning("Could not determine age for wallet %s: %s", agg.wallet, e)
 
     return True
 

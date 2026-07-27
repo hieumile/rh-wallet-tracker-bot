@@ -258,9 +258,18 @@ def _load_existing_wallet_summary(file_path: str) -> dict[tuple[str, str], dict]
             if not wallet or not token:
                 continue
                 
+            score_raw = get_val(row, "Score")
+            score_val = None
+            if score_raw is not None:
+                try:
+                    score_val = float(score_raw)
+                except ValueError:
+                    pass
+                    
             key = (str(wallet).lower(), str(token).lower())
             data[key] = {
                 "wallet": wallet,
+                "score": score_val,
                 "signals": get_val(row, "Insider Signals", ""),
                 "tags": get_val(row, "Tags", ""),
                 "token": token,
@@ -306,6 +315,7 @@ def export_wallet_report(
     merged_data = _load_existing_wallet_summary(output_path)
 
     # Add/update with new aggregates
+    from scoring import wallet_scorer as scorer
     for a in aggregates:
         token_addr = (a.token_address or token_label).lower()
         key = (a.wallet.lower(), token_addr)
@@ -314,8 +324,13 @@ def export_wallet_report(
         winrate_pct = a.winrate * 100 if a.winrate is not None else None
         drawdown_pct = a.wallet_max_drawdown_ratio * 100 if a.wallet_max_drawdown_ratio is not None else None
         
+        # Calculate composite score
+        score_obj = scorer.score_wallet(a)
+        score_val = score_obj.score if score_obj else None
+        
         merged_data[key] = {
             "wallet": a.wallet,
+            "score": score_val,
             "signals": ", ".join(insider_signals(a)),
             "tags": ",".join(a.tags),
             "token": a.token_address or token_label,
@@ -338,10 +353,20 @@ def export_wallet_report(
             "last_trade": _ts_to_dt(a.last_ts),
         }
 
-    # Sort merged rows by profit (falling back to net USD)
+    # Sort merged rows by Score (descending), fallback to profit, then net USD
     def sort_key(item):
-        val = item["profit"] if item["profit"] is not None else item["net_usd"]
-        return (val is not None, val or 0.0)
+        score_val = item.get("score")
+        profit_val = item.get("profit")
+        net_val = item.get("net_usd")
+        
+        k1 = 1 if score_val is not None else 0
+        v1 = score_val if score_val is not None else -999999999.0
+        
+        fallback_val = profit_val if profit_val is not None else net_val
+        k2 = 1 if fallback_val is not None else 0
+        v2 = fallback_val if fallback_val is not None else -999999999.0
+        
+        return (k1, v1, k2, v2)
 
     rows = sorted(merged_data.values(), key=sort_key, reverse=True)
 
@@ -350,7 +375,7 @@ def export_wallet_report(
     ws.title = "Wallet Summary"
 
     headers = [
-        "Wallet", "Insider Signals", "Tags", "Token",
+        "Wallet", "Score", "Insider Signals", "Tags", "Token",
         "Total Buy (USD)", "Total Sell (USD)", "Net (USD)",
         "Buy Count", "Sell Count",
         "Profit (USD)", "Profit Change %",
@@ -364,6 +389,7 @@ def export_wallet_report(
     for r_data in rows:
         ws.append([
             r_data["wallet"],
+            r_data.get("score"),
             r_data["signals"],
             r_data["tags"],
             r_data["token"],
@@ -388,22 +414,24 @@ def export_wallet_report(
         r = ws.max_row
         for c in range(1, len(headers) + 1):
             ws.cell(row=r, column=c).font = BODY_FONT
-        for c in (5, 6, 7, 10, 13, 14):   # USD columns
+        ws.cell(row=r, column=2).number_format = "0.0"       # Score
+        for c in (6, 7, 8, 11, 14, 15):   # USD columns
             ws.cell(row=r, column=c).number_format = "$#,##0"
-        for c in (11, 12, 19):            # percentage columns
+        for c in (12, 13, 20):            # percentage columns
             ws.cell(row=r, column=c).number_format = "0.0"
-        ws.cell(row=r, column=15).number_format = "0.000"        # pnl ratio
-        ws.cell(row=r, column=16).number_format = "0.00"         # profit factor
-        ws.cell(row=r, column=17).number_format = "0.00"         # Sharpe ratio
-        ws.cell(row=r, column=18).number_format = "#,##0"        # tx count
-        for c in (20, 21):                # timestamps
+        ws.cell(row=r, column=16).number_format = "0.000"        # pnl ratio
+        ws.cell(row=r, column=17).number_format = "0.00"         # profit factor
+        ws.cell(row=r, column=18).number_format = "0.00"         # Sharpe ratio
+        ws.cell(row=r, column=19).number_format = "#,##0"        # tx count
+        for c in (21, 22):                # timestamps
             ws.cell(row=r, column=c).number_format = "yyyy-mm-dd hh:mm:ss"
 
     for i, header in enumerate(headers, start=1):
         ws.column_dimensions[get_column_letter(i)].width = max(14, len(header) + 2)
     ws.column_dimensions["A"].width = 44  # wallet address
-    ws.column_dimensions["B"].width = 34  # insider signals
-    ws.column_dimensions["D"].width = 44  # token address
+    ws.column_dimensions["B"].width = 10  # Score
+    ws.column_dimensions["C"].width = 34  # insider signals
+    ws.column_dimensions["E"].width = 44  # token address
 
     note_row = len(rows) + 3
     ws.cell(

@@ -167,6 +167,8 @@ def enrich_with_activity(
                 continue
             if recomputed.total_buy_tokens <= recomputed.total_sell_tokens:
                 continue
+            if (recomputed.total_sell_usd or 0.0) - (recomputed.total_buy_usd or 0.0) >= 0:
+                continue
 
         a.total_buy_usd = recomputed.total_buy_usd
         a.total_sell_usd = recomputed.total_sell_usd
@@ -376,15 +378,33 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
         
     capped_set = set(tx_hashes)
         
+    # Pre-fetch transaction legs in parallel for uncapped transactions
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    tx_legs_map = {}
+    uncapped_hashes = list(capped_set)
+    max_workers = getattr(config, "RPC_MAX_WORKERS", 8)
+    
+    logger.info("Fetching transaction receipts in parallel using %d threads...", max_workers)
+    
+    def fetch_legs(h):
+        try:
+            return h, bs.get_transaction_token_transfers(h)
+        except Exception:
+            return h, []
+            
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_legs, h): h for h in uncapped_hashes}
+        processed_parallel = 0
+        for future in as_completed(futures):
+            h, legs = future.result()
+            tx_legs_map[h] = legs
+            processed_parallel += 1
+            if processed_parallel % 100 == 0 or processed_parallel == len(uncapped_hashes):
+                logger.info("Processed %d/%d receipts...", processed_parallel, len(uncapped_hashes))
+
     for tx_hash, group in tx_groups.items():
         is_capped = tx_hash not in capped_set
-        
-        tx_legs = []
-        if not is_capped:
-            try:
-                tx_legs = bs.get_transaction_token_transfers(tx_hash)
-            except Exception:
-                tx_legs = []
+        tx_legs = tx_legs_map.get(tx_hash, []) if not is_capped else []
             
         for t in group:
             from_hash = (t.get("from") or {}).get("hash", "").lower()
@@ -404,6 +424,15 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
                 side = "sell"
                 wallet = from_hash
                 
+            # Check if swap timestamp falls within the actual window(s)
+            in_window = True
+            if windows:
+                in_window = False
+                for s_ts, e_ts in windows:
+                    if (s_ts is None or approx_ts >= s_ts) and (e_ts is None or approx_ts <= e_ts):
+                        in_window = True
+                        break
+
             # Classify status
             if is_capped:
                 status = "CAPPED_LIMIT_EXCEEDED"
@@ -411,6 +440,8 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
                 status = "ZERO_VALUE_SPAM"
             elif not side or wallet in pool_addresses or not wallet:
                 status = "NON_TRADE_TRANSFER"
+            elif not in_window:
+                status = "OUT_OF_WINDOW"
             else:
                 status = "PENDING"
                 
@@ -481,6 +512,10 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
         total_buy_tokens = sum(t["token_amount"] for t in buys)
         total_sell_tokens = sum(t["token_amount"] for t in sells)
         
+        # Filter out wallets with a net (total sell - total buy) >= 0 in USD value
+        if total_sell_usd - total_buy_usd >= 0:
+            continue
+            
         # Target only wallets with a net buy (holding) position in this window
         net_tokens = total_buy_tokens - total_sell_tokens
         if net_tokens <= 0:

@@ -11,17 +11,19 @@ Hệ thống hoạt động qua 3 phân hệ (subsystems) khép kín để phát
 1. **Thu thập dữ liệu (Ingestion)**: 
    * Mặc định quét trực tiếp On-Chain từ RPC Node của Robinhood Chain để bắt 100% ví giao dịch trong khung giờ.
    * **Hỗ trợ Đa bể thanh khoản (Multi-pool Support)**: Tự động phát hiện và phân tích giao dịch swap trên **tất cả các pool** của token (ví dụ: TOKEN-WETH, TOKEN-USDG, TOKEN-NVDA) thay vì chỉ quét một pool chính có thanh khoản cao nhất.
+   * **Tải song song (Parallel Ingestion)**: Sử dụng luồng chạy song song (`ThreadPoolExecutor`) với mặc định 8 luồng chạy đồng thời giúp tăng tốc độ quét giao dịch lên gấp 5-10 lần.
    * Dùng tùy chọn `--gmgn` để khai thác cơ sở dữ liệu Top Traders của GMGN.
 2. **Đánh giá & Lọc ví (Scoring Engine)**: 
-   * Lọc ví **Net Buyer** (lượng mua > lượng bán) để chỉ giữ lại các ví gom hàng / holding trong khung giờ.
-   * Lọc ví **Độ tuổi tối thiểu** (MIN_WALLET_AGE_DAYS >= 2.0) để loại bỏ các ví burner mới tạo xoay vòng tránh bị theo dấu.
-   * Loại bỏ ví MEV/Sandwich (hold dưới 60s), lọc bot giao dịch (số lệnh > 300), áp dụng sàn winrate tối thiểu 40%, tính toán Max Drawdown, Profit Factor, Sharpe Ratio, và tự động truy vết ví mẹ cấp gas (`insider_funder`). Các ví đạt tiêu chuẩn được lưu vào `output/watchlist.json` và đồng bộ ra `output/watchlist.xlsx`.
+   * Lọc ví **Net Buyer** (mua USD > bán USD & mua Token > bán Token) để chỉ giữ lại các ví gom hàng thực sự trong khung giờ.
+   * Loại bỏ ví MEV/Sandwich (hold dưới 60s) và lọc bot giao dịch (số lệnh > 500).
+   * Lọc thời gian nghiêm ngặt (**Strict Window Filtering**): Loại bỏ các giao dịch nằm ngoài khung giờ quét thực tế khỏi danh mục chấm điểm (đánh dấu là `OUT_OF_WINDOW`).
+   * Chấm điểm điểm số tổng hợp (**Composite Score**) dựa trên: Winrate, PnL Ratio, Profit, Volume, Sharpe Ratio, Profit Factor, Max Drawdown và Moonshot. Các ví có điểm số >= 40.0 được tự động lưu vào `output/watchlist.json` và đồng bộ ra `output/watchlist.xlsx`.
 3. **Phát tín hiệu (Signal Generator)**: Theo dõi danh sách ví trong watchlist để đưa ra cảnh báo giao dịch (`BUY/SELL`), cảnh báo ví mẹ cấp vốn cho ví con mới (`FUNDING`), và cảnh báo mua chung (`Co-Investment`).
 
 ```mermaid
 graph TD
     A[Token Mục Tiêu] -->|RPC Node On-Chain Default / GMGN --gmgn| B(Thu Thập Ví Net Buyer)
-    B -->|Hỗ trợ Multi-pool: TOKEN-WETH, TOKEN-USDG...| C[Scoring Engine: Lọc Net Buy, Tuổi Ví >= 2d, Bot, MEV & Winrate 40% + Sharpe + PF]
+    B -->|Hỗ trợ Multi-pool & Tải Song Song 8 Luồng| C[Scoring Engine: Lọc MEV, Bot & Trích xuất Net USD Buy + Chấm Điểm Composite]
     C -->|Gộp & Lưu| D[output/watchlist.json / output/watchlist.xlsx]
     C -->|Xuất Báo Cáo| E[Spreadsheets Excel Trong Thư Mục output/]
     D -->|Live Scan| F[Signal Generator]
@@ -56,7 +58,17 @@ Khởi chạy bot theo dõi trực tiếp các ví trong watchlist để phát t
   ./watch --min-score 45 --export output/signals.xlsx
   ```
 
-### C. Phím tắt xóa ví khỏi Watchlist (`./unwatch`)
+### C. Phím tắt thêm ví vào Watchlist (`./watch-add`)
+Tìm kiếm ví trong các báo cáo Excel đã xuất tại `output/wallet_summary_*.xlsx` để lấy đầy đủ điểm số/chỉ số hiệu suất và thêm vào Watchlist:
+```bash
+./watch-add <wallet_address_1> [wallet_address_2] ...
+```
+* **Ví dụ**:
+  ```bash
+  ./watch-add 0x5a5fbf2ac4f0f174a72d62cb93728292ae3304d2
+  ```
+
+### D. Phím tắt xóa ví khỏi Watchlist (`./unwatch`)
 Xóa thủ công một hoặc nhiều ví khỏi danh sách theo dõi và tự động đồng bộ hóa sang tệp Excel:
 ```bash
 ./unwatch <wallet_address_1> [wallet_address_2] ...
@@ -84,35 +96,36 @@ Xóa thủ công một hoặc nhiều ví khỏi danh sách theo dõi và tự �
 
 ---
 
-## 4. Cơ chế Chấm điểm & Bộ lọc Cứng
+## 4. Cơ chế Chấm điểm & Bộ lọc Cứng (Hedge-Fund Level Scorer)
 
-### A. Các bộ lọc cứng:
-* **Lọc Ví Net Buyer**: Chỉ chấp nhận ví có lượng mua lớn hơn lượng bán (total_buy_tokens > total_sell_tokens) trong khung thời gian quét.
-* **Lọc độ tuổi tối thiểu**: Chỉ chấp nhận ví hoạt động ít nhất 2 ngày (MIN_WALLET_AGE_DAYS >= 2.0) để loại bỏ ví burner/cycling.
+### A. Các bộ lọc cứng (Gatekeeper Filters):
+* **Lọc Ví Net Buyer**:
+  * **Token**: Chỉ chấp nhận ví có lượng mua lớn hơn lượng bán (`total_buy_tokens > total_sell_tokens`) trong khung thời gian quét.
+  * **Giá trị USD**: Chỉ chấp nhận ví có tổng giá trị mua USD lớn hơn tổng giá trị bán USD trong khung thời gian quét (tương đương `total_sell_usd - total_buy_usd < 0`).
 * **Loại bỏ MEV/Sandwich**: Loại bỏ ví có tag `sandwich_bot` hoặc thời gian nắm giữ trung bình dưới 60 giây.
-* **Lọc Bot giao dịch**: Loại bỏ các ví thực hiện **trên 500 giao dịch** (`MAX_TX_COUNT = 500`) trong 30 ngày.
-* **Sàn Win Rate**: Yêu cầu tỉ lệ thắng lịch sử tối thiểu **40%** (`MIN_WINRATE = 0.40`).
-* **Sàn Max Drawdown**: Loại bỏ ví có mức độ sụt giảm từ đỉnh tài sản vượt quá **60%** (`MAX_DRAWDOWN_RATIO_LIMIT = 0.60`).
-* **Ví mới (Fresh Wallet)**: Ưu tiên giữ lại để chấm điểm sớm, đồng thời tự động truy vết ví chính cấp gas để gán nhãn `insider_funder`.
+* **Lọc Bot giao dịch**: Loại bỏ các ví thực hiện **trên 500 giao dịch** (`MAX_TX_COUNT = 500`) trong 30 ngày (nâng giới hạn để tránh loại bỏ ví hoạt động mạnh).
+
+> [!NOTE]
+> Các bộ lọc khác (Lọc độ tuổi tối thiểu, Max Drawdown, Win Rate, Volume, Lợi nhuận tối thiểu) đã được chuyển đổi hoàn toàn sang **chế độ chấm điểm trọng số (Composite Scoring)** chứ không còn là bộ lọc cứng để tránh bỏ sót các ví tiềm năng.
 
 ### B. Công thức Trọng số Điểm Composite mới (Tổng 100 điểm):
 
 | Chỉ số thành phần | Trọng số |
 | :--- | :---: |
 | **Win Rate** | 10% |
-| **PnL Ratio (ROI)** | 15% |
-| **Profit** | 15% |
-| **Trading Volume** | 10% |
-| **Profit Factor** | 15% |
-| **Sharpe Ratio** | 15% |
+| **PnL Ratio (ROI)** | 10% |
+| **Profit** | 25% |
+| **Trading Volume** | 20% |
+| **Profit Factor** | 10% |
+| **Sharpe Ratio** | 10% |
 | **Max Drawdown** | 10% |
-| **Moonshot** | 10% |
+| **Moonshot** | 5% |
 
 ---
 
 ## 5. Đầu ra Spreadsheet Excel
 
 Sau khi chạy xong lệnh quét `./scrap`, hệ thống tự động xuất các tệp Excel sau vào thư mục `output/` và kích hoạt ứng dụng bảng tính trên màn hình để bạn kiểm toán ngay:
-1. **`output/transactions_<token>.xlsx`** (ví dụ `output/transactions_pons.xlsx`): Chứa tab giao dịch sạch và tab "Raw Transactions" kiểm toán toàn bộ sự kiện thô (MEV, status). Tự động gộp dữ liệu nếu quét nhiều lần.
-2. **`output/wallet_summary_<token>.xlsx`** (ví dụ `output/wallet_summary_pons.xlsx`): Bảng xếp hạng chi tiết các ví gom hàng dự án này.
-3. **`output/watchlist.xlsx`**: Tệp xuất danh sách theo dõi Master chứa các ví uy tín nhất (>= 40 điểm), với cột `Seed Tokens` hiển thị tên Token trực quan (`PONS`, `NOCK`, `WALLET`...).
+1. **`output/transactions_<token>.xlsx`** (ví dụ `output/transactions_pons.xlsx`): Chứa tab giao dịch sạch và tab "Raw Transactions" kiểm toán toàn bộ sự kiện thô (MEV, status, `OUT_OF_WINDOW`). Tự động gộp dữ liệu nếu quét nhiều lần.
+2. **`output/wallet_summary_<token>.xlsx`** (ví dụ `output/wallet_summary_pons.xlsx`): Bảng xếp hạng chi tiết các ví gom hàng dự án này. Chứa cột **Score** (Điểm Composite) được hiển thị nổi bật ở cột thứ 2 và danh sách ví được **sắp xếp giảm dần theo điểm số**.
+3. **`output/watchlist.xlsx`**: Tệp xuất danh sách theo dõi Master chứa các ví uy tín nhất (>= 40 điểm), với cột `Seed Tokens` hiển thị tên Token trực quan (`PONS`, `BRODIE`, `NOCK`...). Được đồng bộ hóa và mở lại tự động khi bạn dùng các phím tắt `./watch-add` hoặc `./unwatch`.

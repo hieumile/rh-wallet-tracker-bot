@@ -262,6 +262,149 @@ def run_remove(args):
     print(f"Remaining wallets: {len(cleaned)}.")
 
 
+def run_add(args):
+    """Add one or more wallets from the summary list into the watchlist."""
+    import json
+    import glob
+    import openpyxl
+    from scoring.wallet_scorer import WalletScore
+    import scoring.watchlist as wl
+    from export_xlxs import export_watchlist
+    
+    watchlist_path = args.watchlist
+    
+    # Ensure output dir exists
+    os.makedirs(os.path.dirname(watchlist_path) or ".", exist_ok=True)
+    
+    scores_to_add = []
+    
+    # Search all wallet summary Excel files
+    summary_files = glob.glob("output/wallet_summary_*.xlsx")
+    
+    for wallet_addr in args.wallets:
+        wallet_clean = wallet_addr.strip().lower()
+        found = False
+        
+        for sf in summary_files:
+            try:
+                wb = openpyxl.load_workbook(sf, data_only=True)
+                if "Wallet Summary" in wb.sheetnames:
+                    ws = wb["Wallet Summary"]
+                    header_row = [str(cell.value).strip().lower() for cell in ws[1]]
+                    
+                    def get_val(row, name, default=None):
+                        try:
+                            idx = header_row.index(name.lower())
+                            return row[idx] if idx < len(row) else default
+                        except ValueError:
+                            return default
+                            
+                    for row in ws.iter_rows(min_row=2, values_only=True):
+                        if not row or len(row) < 2:
+                            continue
+                        curr_wallet = row[0]
+                        if curr_wallet and str(curr_wallet).lower().strip() == wallet_clean:
+                            # Extract stats
+                            token = get_val(row, "Token")
+                            score = get_val(row, "Score")
+                            score = float(score) if score is not None else 0.0
+                            
+                            winrate_raw = get_val(row, "Winrate %")
+                            winrate = float(winrate_raw) / 100.0 if winrate_raw is not None else None
+                            
+                            drawdown_raw = get_val(row, "Wallet Max Drawdown %")
+                            drawdown = float(drawdown_raw) / 100.0 if drawdown_raw is not None else None
+                            
+                            tags = str(get_val(row, "Tags", "")).split(",") if get_val(row, "Tags") else []
+                            signals = str(get_val(row, "Insider Signals", "")).split(",") if get_val(row, "Insider Signals") else []
+                            
+                            ws_obj = WalletScore(
+                                wallet=curr_wallet,
+                                score=score,
+                                seed_token=token,
+                                winrate=winrate,
+                                realized_profit_usd=get_val(row, "Wallet Profit (period)"),
+                                pnl_ratio=get_val(row, "Wallet PnL Ratio"),
+                                token_num=None,
+                                moonshot_count=None,
+                                max_drawdown_ratio=drawdown,
+                                volume_usd=get_val(row, "Wallet Volume (USD)"),
+                                profit_factor=get_val(row, "Wallet Profit Factor"),
+                                sharpe_ratio=get_val(row, "Wallet Sharpe Ratio"),
+                                tx_count=get_val(row, "Wallet Tx Count"),
+                                tags=[t.strip() for t in tags if t.strip()],
+                                insider_signals=[s.strip() for s in signals if s.strip()],
+                                components={}
+                            )
+                            scores_to_add.append(ws_obj)
+                            print(f"Found wallet {wallet_addr} in {sf} (Score: {score}).")
+                            found = True
+                            break
+            except Exception as e:
+                print(f"Error scanning {sf}: {e}")
+            if found:
+                break
+                
+        if not found:
+            # Fallback: add with blank / default stats if not found in summaries
+            print(f"Warning: Wallet {wallet_addr} not found in any summary Excel files. Adding with default stats.")
+            ws_obj = WalletScore(
+                wallet=wallet_addr,
+                score=0.0,
+                seed_token=None,
+                winrate=None,
+                realized_profit_usd=None,
+                pnl_ratio=None,
+                token_num=None,
+                moonshot_count=None,
+                max_drawdown_ratio=None,
+                volume_usd=None,
+                profit_factor=None,
+                sharpe_ratio=None,
+                tx_count=None,
+                tags=["manually_added"],
+                insider_signals=[],
+                components={}
+            )
+            scores_to_add.append(ws_obj)
+            
+    if not scores_to_add:
+        print("No wallets to add.")
+        return
+        
+    # Group by seed token to invoke upsert for each seed token groups
+    from collections import defaultdict
+    by_token = defaultdict(list)
+    for s in scores_to_add:
+        by_token[s.seed_token].append(s)
+        
+    watchlist_map = {}
+    for token, list_s in by_token.items():
+        watchlist_map = wl.upsert(
+            watchlist_path, list_s, seed_token=token
+        )
+        
+    # Export watchlist to Excel
+    excel_path = watchlist_path.replace(".json", ".xlsx")
+    try:
+        export_watchlist(watchlist_map, excel_path)
+        excel_msg = f" and synchronized {excel_path}"
+        
+        # Auto-open/reload the updated Excel file
+        import subprocess
+        abs_path = os.path.abspath(excel_path)
+        if sys.platform == "darwin":
+            subprocess.run(["open", abs_path], check=True)
+        elif sys.platform.startswith("win"):
+            os.startfile(abs_path)
+        else:
+            subprocess.run(["xdg-open", abs_path], check=True)
+    except Exception as e:
+        excel_msg = f" (failed to sync/open Excel: {e})"
+        
+    print(f"Successfully added {len(scores_to_add)} wallet(s) to watchlist{excel_msg}.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Unified CLI interface for Robinhood Chain Wallet Tracker Bot."
@@ -297,6 +440,11 @@ def main():
     remove_parser.add_argument("wallets", nargs="+", help="Wallet addresses (0x...) to remove.")
     remove_parser.add_argument("--watchlist", default="output/watchlist.json", help="Path to watchlist file.")
     
+    # Subcommand: add
+    add_parser = subparsers.add_parser("add", help="Add one or more wallets from the summary list into the watchlist.")
+    add_parser.add_argument("wallets", nargs="+", help="Wallet addresses (0x...) to add.")
+    add_parser.add_argument("--watchlist", default="output/watchlist.json", help="Path to watchlist file.")
+    
     # Parse defined arguments, leaving extra unparsed args to be forwarded
     args, extra_args = parser.parse_known_args()
     
@@ -306,6 +454,8 @@ def main():
         run_watch(args, extra_args)
     elif args.command == "remove":
         run_remove(args)
+    elif args.command == "add":
+        run_add(args)
 
 
 if __name__ == "__main__":
