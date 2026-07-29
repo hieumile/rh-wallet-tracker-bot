@@ -263,5 +263,22 @@ def rank_wallets(aggregates: list[WalletAggregate]) -> list[WalletScore]:
     """Score every aggregate and return the survivors ranked high to low."""
     scored = [score_wallet(a) for a in aggregates]
     scored = [s for s in scored if s is not None]
+    
+    # Run Sybil/Gas-funding clustering on candidate wallets
+    try:
+        from scoring.sybil import detect_sybil_networks
+        wallets_to_check = [s.wallet for s in scored]
+        clusters = detect_sybil_networks(wallets_to_check)
+        for parent, children in clusters.items():
+            for s in scored:
+                if s.wallet.lower() in children:
+                    if "sybil_cluster" not in s.tags:
+                        s.tags.append("sybil_cluster")
+                    sig_label = f"sybil(parent:{parent[:6]}...{parent[-4:]})"
+                    if sig_label not in s.insider_signals:
+                        s.insider_signals.append(sig_label)
+    except Exception as e:
+        logger.warning("Sybil detection failed during ranking: %s", e)
+        
     scored.sort(key=lambda s: s.score, reverse=True)
     return scored

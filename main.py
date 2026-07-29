@@ -377,30 +377,11 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
         logger.warning("Capping scan at %d transactions to avoid rate limit throttling.", tx_limit)
         
     capped_set = set(tx_hashes)
-        
-    # Pre-fetch transaction legs in parallel for uncapped transactions
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    tx_legs_map = {}
     uncapped_hashes = list(capped_set)
-    max_workers = getattr(config, "RPC_MAX_WORKERS", 8)
-    
-    logger.info("Fetching transaction receipts in parallel using %d threads...", max_workers)
-    
-    def fetch_legs(h):
-        try:
-            return h, bs.get_transaction_token_transfers(h)
-        except Exception:
-            return h, []
-            
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(fetch_legs, h): h for h in uncapped_hashes}
-        processed_parallel = 0
-        for future in as_completed(futures):
-            h, legs = future.result()
-            tx_legs_map[h] = legs
-            processed_parallel += 1
-            if processed_parallel % 100 == 0 or processed_parallel == len(uncapped_hashes):
-                logger.info("Processed %d/%d receipts...", processed_parallel, len(uncapped_hashes))
+        
+    # Pre-fetch transaction legs in batch for uncapped transactions
+    logger.info("Fetching transaction receipts in batches from RPC...")
+    tx_legs_map = bs.get_transaction_token_transfers_batch(uncapped_hashes)
 
     for tx_hash, group in tx_groups.items():
         is_capped = tx_hash not in capped_set

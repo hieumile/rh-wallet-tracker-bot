@@ -105,10 +105,40 @@ def block_timestamp(block_number: int) -> int:
     return int(dt.timestamp())
 
 
+_block_time_cache = {}
+
+
+def get_block_timestamp(block_num: int) -> int:
+    """Fetch the timestamp of a block using JSON-RPC, with caching."""
+    if block_num in _block_time_cache:
+        return _block_time_cache[block_num]
+        
+    rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_getBlockByNumber",
+        "params": [hex(block_num), False],
+        "id": 1
+    }
+    for attempt in range(3):
+        try:
+            r = requests.post(rpc_url, json=payload, headers={"Content-Type": "application/json"}, timeout=5)
+            if r.status_code == 200:
+                res = r.json().get("result") or {}
+                ts_hex = res.get("timestamp")
+                if ts_hex:
+                    ts = int(ts_hex, 16)
+                    _block_time_cache[block_num] = ts
+                    return ts
+        except Exception:
+            pass
+    return 0
+
+
 def get_block_by_timestamp(target_ts: int, latest_block: int | None = None) -> int:
     """
-    Estimate block number using a stable 2.0s block time on Robinhood Chain,
-    bypassing Blockscout binary search to avoid rate limit or 503/404 errors.
+    Find the block closest to target_ts using a localized binary search around
+    a stable linear estimate, using an in-memory cache to minimize RPC overhead.
     """
     import time
     now_ts = int(time.time())
@@ -117,11 +147,38 @@ def get_block_by_timestamp(target_ts: int, latest_block: int | None = None) -> i
     if target_ts >= now_ts:
         return hi
         
-    # Robinhood chain has a steady ~2.0s block time
+    # 1. Initial linear estimate
     diff_seconds = now_ts - target_ts
-    estimated_diff_blocks = int(diff_seconds / 2.0)
+    est = max(0, hi - int(diff_seconds / 2.0))
     
-    return max(0, hi - estimated_diff_blocks)
+    # 2. Localized range search (±5000 blocks around estimate)
+    low = max(0, est - 5000)
+    high = min(hi, est + 5000)
+    
+    # Perform binary search
+    best_block = est
+    best_diff = float("inf")
+    
+    while low <= high:
+        mid = (low + high) // 2
+        ts = get_block_timestamp(mid)
+        if ts == 0:
+            # Fallback if RPC fails
+            break
+            
+        diff = ts - target_ts
+        if abs(diff) < best_diff:
+            best_diff = abs(diff)
+            best_block = mid
+            
+        if ts < target_ts:
+            low = mid + 1
+        elif ts > target_ts:
+            high = mid - 1
+        else:
+            return mid
+            
+    return best_block
 
 
 def get_token_transfers(token_address: str, start_block: int, end_block: int) -> list[dict]:
@@ -327,6 +384,131 @@ def get_transaction_token_transfers(tx_hash: str) -> list[dict]:
             
     logger.error("Failed to fetch RPC receipt for transaction %s after 3 attempts.", tx_hash)
     return []
+
+
+def get_transaction_token_transfers_batch(tx_hashes: list[str]) -> dict[str, list[dict]]:
+    """
+    Fetch token transfers for multiple transaction hashes in batches using direct JSON-RPC batch requests.
+    Returns a dict mapping tx_hash to its list of transfer legs.
+    """
+    if not tx_hashes:
+        return {}
+        
+    rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+    transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    
+    results = {}
+    # Chunk tx_hashes into groups of 50 to avoid RPC payload size limits
+    chunk_size = 50
+    chunks = [tx_hashes[i:i + chunk_size] for i in range(0, len(tx_hashes), chunk_size)]
+    
+    for chunk in chunks:
+        # Build batch request payload
+        payload = []
+        for idx, h in enumerate(chunk):
+            payload.append({
+                "jsonrpc": "2.0",
+                "method": "eth_getTransactionReceipt",
+                "params": [h],
+                "id": idx
+            })
+            
+        # Initialize results for this chunk to empty lists
+        for h in chunk:
+            results[h] = []
+            
+        success = False
+        for attempt in range(3):
+            try:
+                r = requests.post(
+                    rpc_url, 
+                    json=payload, 
+                    headers={"Content-Type": "application/json"}, 
+                    timeout=config.REQUEST_TIMEOUT_SECONDS
+                )
+                if r.status_code == 200:
+                    batch_resp = r.json()
+                    # Batch response can be a list or a single dict (if chunk was 1)
+                    if isinstance(batch_resp, dict):
+                        batch_resp = [batch_resp]
+                        
+                    # Build index-to-txhash mapping for this chunk
+                    id_to_hash = {idx: h for idx, h in enumerate(chunk)}
+                    
+                    for item in batch_resp:
+                        if not isinstance(item, dict):
+                            continue
+                        req_id = item.get("id")
+                        tx_hash = id_to_hash.get(req_id)
+                        if not tx_hash:
+                            continue
+                            
+                        if "error" in item:
+                            logger.warning("Batch RPC error for tx %s: %s", tx_hash, item["error"])
+                            continue
+                            
+                        receipt = item.get("result") or {}
+                        logs = receipt.get("logs") or []
+                        legs = []
+                        for log in logs:
+                            topics = log.get("topics") or []
+                            if len(topics) < 3:
+                                continue
+                            if topics[0].lower() != transfer_topic:
+                                continue
+                                
+                            addr = log.get("address", "").lower()
+                            from_addr = "0x" + topics[1][-40:]
+                            to_addr = "0x" + topics[2][-40:]
+                            
+                            val_hex = log.get("data") or "0x0"
+                            try:
+                                value = int(val_hex, 16)
+                            except ValueError:
+                                value = 0
+                                
+                            decimals = 18
+                            symbol = "TOKEN"
+                            if addr == "0x0bd7d308f8e1639fab988df18a8011f41eacad73": # WETH
+                                symbol = "WETH"
+                                decimals = 18
+                            elif addr == "0x5fc5360d0400a0fd4f2af552add042d716f1d168": # USDG
+                                symbol = "USDG"
+                                decimals = 6
+                            elif "usd" in addr:
+                                symbol = "USD"
+                                decimals = 6
+                                
+                            legs.append({
+                                "token": {
+                                    "address_hash": addr,
+                                    "decimals": decimals,
+                                    "symbol": symbol
+                                },
+                                "total": {
+                                    "value": str(value)
+                                },
+                                "from": {
+                                    "hash": from_addr
+                                },
+                                "to": {
+                                    "hash": to_addr
+                                }
+                            })
+                        results[tx_hash] = legs
+                    success = True
+                    break
+                else:
+                    logger.warning("RPC Batch getTransactionReceipt status %d, retrying...", r.status_code)
+                    time.sleep(1.0)
+            except Exception as e:
+                logger.warning("RPC Batch getTransactionReceipt failed: %s, retrying...", e)
+                time.sleep(1.0)
+                
+        if not success:
+            logger.error("Failed to fetch RPC receipt batch for %d hashes after 3 attempts.", len(chunk))
+            
+    return results
 
 
 def get_transaction_logs(tx_hash: str) -> list[dict]:
