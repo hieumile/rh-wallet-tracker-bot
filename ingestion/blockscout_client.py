@@ -65,6 +65,28 @@ def _get(path: str, params: dict | None = None) -> dict:
     raise BlockscoutError(f"Blockscout GET {path} failed after maximum retry attempts")
 
 
+def is_contract_address(address: str) -> bool:
+    """Check if an address is a smart contract (contains bytecode) on Robinhood Chain."""
+    rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_getCode",
+        "params": [address, "latest"],
+        "id": 1
+    }
+    for attempt in range(3):
+        try:
+            r = requests.post(rpc_url, json=payload, headers={"Content-Type": "application/json"}, timeout=5)
+            if r.status_code == 200:
+                result = r.json().get("result") or "0x"
+                return result != "0x" and result != ""
+            elif r.status_code == 429:
+                time.sleep(1.0)
+        except Exception:
+            pass
+    return False
+
+
 def get_latest_block_number() -> int:
     """Current chain height, fetched directly from JSON-RPC node for 100% stability."""
     rpc_url = "https://rpc.mainnet.chain.robinhood.com"
@@ -120,7 +142,8 @@ def get_block_timestamp(block_num: int) -> int:
         "params": [hex(block_num), False],
         "id": 1
     }
-    for attempt in range(3):
+    import time
+    for attempt in range(5):
         try:
             r = requests.post(rpc_url, json=payload, headers={"Content-Type": "application/json"}, timeout=5)
             if r.status_code == 200:
@@ -130,15 +153,19 @@ def get_block_timestamp(block_num: int) -> int:
                     ts = int(ts_hex, 16)
                     _block_time_cache[block_num] = ts
                     return ts
+            elif r.status_code == 429:
+                time.sleep(2.0 ** attempt)
+            else:
+                time.sleep(1.0)
         except Exception:
-            pass
+            time.sleep(1.0)
     return 0
 
 
 def get_block_by_timestamp(target_ts: int, latest_block: int | None = None) -> int:
     """
-    Find the block closest to target_ts using a localized binary search around
-    a stable linear estimate, using an in-memory cache to minimize RPC overhead.
+    Find the block closest to target_ts using a standard binary search over the entire block range,
+    using an in-memory cache to minimize RPC overhead.
     """
     import time
     now_ts = int(time.time())
@@ -147,24 +174,18 @@ def get_block_by_timestamp(target_ts: int, latest_block: int | None = None) -> i
     if target_ts >= now_ts:
         return hi
         
-    # 1. Initial linear estimate
-    diff_seconds = now_ts - target_ts
-    est = max(0, hi - int(diff_seconds / 2.0))
+    low = 0
+    high = hi
     
-    # 2. Localized range search (±5000 blocks around estimate)
-    low = max(0, est - 5000)
-    high = min(hi, est + 5000)
-    
-    # Perform binary search
-    best_block = est
+    best_block = hi
     best_diff = float("inf")
     
     while low <= high:
         mid = (low + high) // 2
         ts = get_block_timestamp(mid)
         if ts == 0:
-            # Fallback if RPC fails
-            break
+            # Fallback to linear estimation if RPC fails
+            ts = now_ts - int((hi - mid) * 0.1)
             
         diff = ts - target_ts
         if abs(diff) < best_diff:
@@ -199,8 +220,8 @@ def get_token_transfers(token_address: str, start_block: int, end_block: int) ->
     rpc_url = "https://rpc.mainnet.chain.robinhood.com"
     transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
     
-    # Chunk size: 5,000 blocks to stay comfortably under standard RPC size/weight limits
-    chunk_size = 5000
+    # Chunk size: 100,000 blocks to stay within RPC limits while minimizing request count
+    chunk_size = 100000
     transfers: list[dict] = []
     
     current_start = start_block
@@ -258,14 +279,23 @@ def get_token_transfers(token_address: str, start_block: int, end_block: int) ->
                     success = True
                     break
                 else:
-                    logger.warning("RPC returned status %d (attempt %d/3), retrying...", r.status_code, attempt + 1)
-                    time.sleep(1.0)
+                    backoff = 3.0 if r.status_code == 429 else 1.0
+                    logger.warning("RPC returned status %d (attempt %d/3), retrying after %.1fs...", r.status_code, attempt + 1, backoff)
+                    time.sleep(backoff)
             except Exception as e:
-                logger.warning("RPC call failed (attempt %d/3): %s. Retrying...", attempt + 1, e)
-                time.sleep(1.0)
+                logger.warning("RPC call failed (attempt %d/3): %s. Retrying after 2.0s...", attempt + 1, e)
+                time.sleep(2.0)
                 
         if not success:
             raise BlockscoutError(f"Failed to fetch RPC logs for block range {current_start}-{current_end}")
+            
+        # Log progress for transfer ingestion
+        processed_blocks = min(current_end - start_block + 1, end_block - start_block + 1)
+        total_blocks = end_block - start_block + 1
+        logger.info(
+            "Fetching transfers: parsed %d/%d blocks (chunk: %d-%d), found %d transfers so far...",
+            processed_blocks, total_blocks, current_start, current_end, len(transfers)
+        )
             
         current_start = current_end + 1
         
@@ -398,11 +428,11 @@ def get_transaction_token_transfers_batch(tx_hashes: list[str]) -> dict[str, lis
     transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
     
     results = {}
-    # Chunk tx_hashes into groups of 50 to avoid RPC payload size limits
-    chunk_size = 50
+    # Reduced chunk size to 15 to stay within strict RPC rate limit caps
+    chunk_size = 15
     chunks = [tx_hashes[i:i + chunk_size] for i in range(0, len(tx_hashes), chunk_size)]
     
-    for chunk in chunks:
+    for idx_chunk, chunk in enumerate(chunks):
         # Build batch request payload
         payload = []
         for idx, h in enumerate(chunk):
@@ -418,7 +448,8 @@ def get_transaction_token_transfers_batch(tx_hashes: list[str]) -> dict[str, lis
             results[h] = []
             
         success = False
-        for attempt in range(3):
+        # Increase attempts to 4
+        for attempt in range(4):
             try:
                 r = requests.post(
                     rpc_url, 
@@ -499,14 +530,24 @@ def get_transaction_token_transfers_batch(tx_hashes: list[str]) -> dict[str, lis
                     success = True
                     break
                 else:
-                    logger.warning("RPC Batch getTransactionReceipt status %d, retrying...", r.status_code)
-                    time.sleep(1.0)
+                    # Exponential or longer backoff for 429 rate limit
+                    backoff = 3.0 if r.status_code == 429 else 1.5
+                    logger.warning("RPC Batch getTransactionReceipt status %d, retrying after %.1fs...", r.status_code, backoff)
+                    time.sleep(backoff)
             except Exception as e:
-                logger.warning("RPC Batch getTransactionReceipt failed: %s, retrying...", e)
-                time.sleep(1.0)
+                logger.warning("RPC Batch getTransactionReceipt failed: %s, retrying after 2.0s...", e)
+                time.sleep(2.0)
                 
         if not success:
-            logger.error("Failed to fetch RPC receipt batch for %d hashes after 3 attempts.", len(chunk))
+            logger.error("Failed to fetch RPC receipt batch for %d hashes after 4 attempts.", len(chunk))
+            
+        # Log progress
+        fetched_count = min((idx_chunk + 1) * chunk_size, len(tx_hashes))
+        logger.info("Fetched receipts for %d/%d transactions...", fetched_count, len(tx_hashes))
+            
+        # Add a minor delay between chunks to be gentler on the public RPC node
+        if idx_chunk < len(chunks) - 1:
+            time.sleep(0.1)
             
     return results
 

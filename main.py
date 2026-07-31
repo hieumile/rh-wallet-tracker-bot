@@ -167,7 +167,7 @@ def enrich_with_activity(
                 continue
             if recomputed.total_buy_tokens <= recomputed.total_sell_tokens:
                 continue
-            if (recomputed.total_sell_usd or 0.0) - (recomputed.total_buy_usd or 0.0) >= 0:
+            if (recomputed.total_buy_usd or 0.0) - (recomputed.total_sell_usd or 0.0) < 1000:
                 continue
 
         a.total_buy_usd = recomputed.total_buy_usd
@@ -301,7 +301,38 @@ def _build_windows(args) -> list[tuple[int | None, int | None]]:
             _parse_dt(args.date_to, end=True) if args.date_to else None,
         ))
     return windows
-def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None, int | None]], limit: int = 50, tx_limit: int = 1000) -> tuple[list[agg.WalletAggregate], list[dict], list[dict]]:
+
+
+def _parse_peak_candle(args) -> tuple[int, int] | None:
+    """Parse start time and optional duration for the peak candle."""
+    if not args.peak:
+        return None
+        
+    peak_args = list(args.peak)
+    duration_sec = 3600 # default 1 hour
+    
+    last_arg = peak_args[-1].strip().lower()
+    if last_arg.endswith("m") or last_arg.endswith("h"):
+        try:
+            val = int(last_arg[:-1])
+            if last_arg.endswith("m"):
+                duration_sec = val * 60
+            else:
+                duration_sec = val * 3600
+            peak_args.pop()
+        except ValueError:
+            pass
+            
+    date_str = " ".join(peak_args).strip()
+    try:
+        start_ts = _parse_dt(date_str)
+        return start_ts, start_ts + duration_sec
+    except Exception as e:
+        logger.warning("Could not parse peak candle start time: %s. Error: %s", date_str, e)
+        return None
+
+
+def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None, int | None]], limit: int = 50, tx_limit: int = 1000, peak_window: tuple[int, int] | None = None) -> tuple[list[agg.WalletAggregate], list[dict], list[dict]]:
     """
     Fetch raw transfers from Blockscout, classify swaps against the pool,
     reconstruct prices, calculate local wallet PnL, and return (aggregates, raw_trades).
@@ -314,7 +345,25 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
         latest_block = 9000000
         
     block_ranges = []
-    if not windows:
+    if peak_window and windows:
+        # Merge all windows + peak window into a single continuous range
+        all_timestamps = []
+        for s_ts, e_ts in windows:
+            if s_ts: all_timestamps.append(s_ts)
+            if e_ts: all_timestamps.append(e_ts)
+        p_start, p_end = peak_window
+        all_timestamps.extend([p_start, p_end])
+        
+        min_ts = min(all_timestamps)
+        max_ts = max(all_timestamps)
+        
+        s_blk = bs.get_block_by_timestamp(min_ts, latest_block)
+        s_blk = max(0, s_blk - 15000)
+        e_blk = bs.get_block_by_timestamp(max_ts, latest_block)
+        e_blk = e_blk + 15000
+        block_ranges.append((s_blk, e_blk))
+        logger.info("Continuous mode: Fetching block range %d -> %d spanning accumulation to peak...", s_blk, e_blk)
+    elif not windows:
         # Default: last 10,000 blocks
         block_ranges.append((latest_block - 10000, latest_block))
     else:
@@ -329,7 +378,19 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
             
     # 2. Get Uniswap Pair address
     pairs = dex.get_pairs_for_token(token_address)
-    pool_addresses = {p.get("pairAddress", "").lower() for p in pairs if p.get("pairAddress")}
+    pool_addresses = set()
+    has_v4 = False
+    for p in pairs:
+        addr = p.get("pairAddress")
+        if addr:
+            addr_lower = addr.lower()
+            pool_addresses.add(addr_lower)
+            if len(addr_lower) == 66: # Uniswap V4 poolId
+                has_v4 = True
+    if has_v4:
+        # Add the Uniswap V4 PoolManager singleton address on Robinhood Chain
+        pool_addresses.add("0x8366a39cc670b4001a1121b8f6a443a643e40951")
+        
     pair_address = dex.get_primary_pair(token_address)
     pool_addr = pair_address.get("pairAddress", "").lower() if pair_address else ""
     if not pool_addresses:
@@ -357,150 +418,375 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
             
     if not all_transfers:
         logger.warning("No raw transfers found on-chain.")
-        return [], [], []
+        return [], [], []  # 4. Preliminary log-level filtering to identify candidate wallets
+    # Estimate average block time dynamically based on resolved blocks
+    block_time = 0.1  # default for Robinhood Chain (0.1s)
+    anchor_blk = latest_block
+    anchor_ts = now_ts
+    
+    all_ts = []
+    for s_ts, e_ts in windows:
+        if s_ts: all_ts.append(s_ts)
+        if e_ts: all_ts.append(e_ts)
+    if peak_window:
+        all_ts.extend([peak_window[0], peak_window[1]])
         
-    # 4. Group transfers by transaction hash
+    if all_ts:
+        min_ts = min(all_ts)
+        max_ts = max(all_ts)
+        try:
+            min_blk = bs.get_block_by_timestamp(min_ts, latest_block)
+            max_blk = bs.get_block_by_timestamp(max_ts, latest_block)
+            blk_diff = max_blk - min_blk
+            ts_diff = max_ts - min_ts
+            if blk_diff > 0:
+                block_time = ts_diff / blk_diff
+                anchor_blk = min_blk
+                anchor_ts = min_ts
+        except Exception:
+            pass
+
     tx_groups = {}
     for t in all_transfers:
         tx_hash = t.get("transaction_hash")
-        tx_groups.setdefault(tx_hash, []).append(t)
-        
-    logger.info("Processing %d unique transactions...", len(tx_groups))
-    
-    trades = []
-    raw_trades = []
-    processed_count = 0
-    
-    # Cap processing to avoid rate limiting
-    tx_hashes = list(tx_groups.keys())[:tx_limit]
-    if len(tx_groups) > tx_limit:
-        logger.warning("Capping scan at %d transactions to avoid rate limit throttling.", tx_limit)
-        
-    capped_set = set(tx_hashes)
-    uncapped_hashes = list(capped_set)
-        
-    # Pre-fetch transaction legs in batch for uncapped transactions
-    logger.info("Fetching transaction receipts in batches from RPC...")
-    tx_legs_map = bs.get_transaction_token_transfers_batch(uncapped_hashes)
-
-    for tx_hash, group in tx_groups.items():
-        is_capped = tx_hash not in capped_set
-        tx_legs = tx_legs_map.get(tx_hash, []) if not is_capped else []
+        if tx_hash:
+            tx_groups.setdefault(tx_hash, []).append(t)
             
+    wallet_log_trades = {}
+    for tx_hash, group in tx_groups.items():
+        has_pool = False
+        for t in group:
+            from_hash = (t.get("from") or {}).get("hash", "").lower()
+            to_hash = (t.get("to") or {}).get("hash", "").lower()
+            if from_hash in pool_addresses or to_hash in pool_addresses:
+                has_pool = True
+                break
+        if not has_pool:
+            continue
+            
+        senders = set()
+        receivers = set()
+        amounts_sent = {}
+        amounts_received = {}
+        
         for t in group:
             from_hash = (t.get("from") or {}).get("hash", "").lower()
             to_hash = (t.get("to") or {}).get("hash", "").lower()
             val_str = t.get("total", {}).get("value") or "0"
             decimals = int(t.get("token", {}).get("decimals") or 18)
             amount = float(val_str) / (10 ** decimals)
-            block_num = int(t.get("block_number") or 0)
-            approx_ts = now_ts - (latest_block - block_num) * 2
             
-            side = None
-            wallet = None
-            if from_hash in pool_addresses:
-                side = "buy"
-                wallet = to_hash
-            elif to_hash in pool_addresses:
-                side = "sell"
-                wallet = from_hash
+            if from_hash:
+                senders.add(from_hash)
+                amounts_sent[from_hash] = amounts_sent.get(from_hash, 0.0) + amount
+            if to_hash:
+                receivers.add(to_hash)
+                amounts_received[to_hash] = amounts_received.get(to_hash, 0.0) + amount
                 
-            # Check if swap timestamp falls within the actual window(s)
-            in_window = True
-            if windows:
-                in_window = False
-                for s_ts, e_ts in windows:
-                    if (s_ts is None or approx_ts >= s_ts) and (e_ts is None or approx_ts <= e_ts):
-                        in_window = True
-                        break
-
-            # Classify status
-            if is_capped:
-                status = "CAPPED_LIMIT_EXCEEDED"
-            elif amount <= 0.0:
-                status = "ZERO_VALUE_SPAM"
-            elif not side or wallet in pool_addresses or not wallet:
-                status = "NON_TRADE_TRANSFER"
-            elif not in_window:
-                status = "OUT_OF_WINDOW"
-            else:
-                status = "PENDING"
+        original_senders = senders - receivers
+        final_receivers = receivers - senders
+        
+        token_lower = token_address.lower()
+        candidates_send = {s for s in original_senders if s not in pool_addresses and s != token_lower and s != "0x0000000000000000000000000000000000000000"}
+        candidates_recv = {r for r in final_receivers if r not in pool_addresses and r != token_lower and r != "0x0000000000000000000000000000000000000000"}
+        
+        pool_receivers = {t.get("to", {}).get("hash", "").lower() for t in group} & pool_addresses
+        pool_senders = {t.get("from", {}).get("hash", "").lower() for t in group} & pool_addresses
+        
+        side = None
+        wallet = None
+        amount = 0.0
+        
+        if pool_receivers and candidates_send:
+            side = "sell"
+            wallet = max(candidates_send, key=lambda s: amounts_sent.get(s, 0.0))
+            amount = amounts_sent[wallet]
+        elif pool_senders and candidates_recv:
+            side = "buy"
+            wallet = max(candidates_recv, key=lambda r: amounts_received.get(r, 0.0))
+            amount = amounts_received[wallet]
+            
+        if not side or not wallet or amount <= 0.0:
+            continue
+            
+        block_num = int(group[0].get("block_number") or 0)
+        approx_ts = anchor_ts + int((block_num - anchor_blk) * block_time)
+        
+        trade = {
+            "transaction_hash": tx_hash,
+            "timestamp": approx_ts,
+            "side": side,
+            "token_amount": amount,
+            "block_number": block_num
+        }
+        wallet_log_trades.setdefault(wallet, []).append(trade)
+        
+    candidate_wallets = []
+    total_wallets = len(wallet_log_trades)
+    logger.info("Analyzing %d unique wallets at log-level...", total_wallets)
+    for idx_w, (wallet, w_trades) in enumerate(wallet_log_trades.items()):
+        if (idx_w + 1) % 100 == 0 or idx_w + 1 == total_wallets:
+            logger.info("Analyzed %d/%d wallets...", idx_w + 1, total_wallets)
+        w_trades.sort(key=lambda x: x["timestamp"])
+        
+        # Split trades into accumulation, interim, and peak window groups
+        accum_trades = []
+        for t in w_trades:
+            in_accum = False
+            for s_ts, e_ts in windows:
+                if (s_ts is None or t["timestamp"] >= s_ts) and (e_ts is None or t["timestamp"] <= e_ts):
+                    in_accum = True
+                    break
+            if in_accum:
+                accum_trades.append(t)
                 
-            usd_value = 0.0
-            if status == "PENDING":
-                # Reconstruct price using the other legs
-                for leg in tx_legs:
-                    leg_token = (leg.get("token") or {}).get("address_hash", "").lower()
-                    leg_val = float(leg.get("total", {}).get("value") or 0.0)
-                    leg_dec = int((leg.get("token") or {}).get("decimals") or 18)
-                    
-                    # WETH
-                    if leg_token == "0x0bd7d308f8e1639fab988df18a8011f41eacad73":
-                        usd_value = (leg_val / (10 ** leg_dec)) * weth_price
-                        break
-                    # USDC / USDT
-                    elif "usd" in (leg.get("token") or {}).get("symbol", "").lower():
-                        usd_value = leg_val / (10 ** leg_dec)
-                        break
-                        
-                # Fallback
-                if usd_value == 0.0 and pair_address:
-                    usd_value = amount * float(pair_address.get("priceUsd") or 0.0)
-                    
-            price_usd = usd_value / amount if amount > 0 else 0.0
+        peak_trades = []
+        if peak_window:
+            p_start, p_end = peak_window
+            peak_trades = [t for t in w_trades if t["timestamp"] >= p_start and t["timestamp"] <= p_end]
             
-            raw_trades.append({
-                "transaction_hash": tx_hash,
-                "timestamp": approx_ts,
-                "wallet": wallet or from_hash,
-                "side": side or "TRANSFER",
-                "token_amount": amount,
-                "usd_value": usd_value,
-                "status": status,
-                "token": {"address": token_address, "symbol": "TOKEN"}
-            })
+        interim_trades = []
+        if peak_window and windows:
+            last_end_ts = max(e_ts for s_ts, e_ts in windows if e_ts is not None)
+            p_start, p_end = peak_window
+            interim_trades = [t for t in w_trades if t["timestamp"] > last_end_ts and t["timestamp"] < p_start]
             
-            if status == "PENDING":
-                trades.append({
-                    "transaction_hash": tx_hash,
-                    "timestamp": approx_ts,
-                    "wallet": wallet,
-                    "side": side,
-                    "token_amount": amount,
-                    "usd_value": usd_value,
-                    "price": price_usd,
-                })
+        accum_buys = [t for t in accum_trades if t["side"] == "buy"]
+        accum_sells = [t for t in accum_trades if t["side"] == "sell"]
+        
+        total_buy_tokens = sum(t["token_amount"] for t in accum_buys)
+        total_sell_tokens = sum(t["token_amount"] for t in accum_sells)
+        
+        net_tokens = total_buy_tokens - total_sell_tokens
+        if net_tokens <= 0:
+            continue
             
-        if not is_capped:
-            processed_count += 1
-            if processed_count % 100 == 0:
-                logger.info("Processed %d/%d transactions...", processed_count, len(tx_hashes))
+        if peak_window:
+            interim_sells = [t for t in interim_trades if t["side"] == "sell"]
+            interim_buys = [t for t in interim_trades if t["side"] == "buy"]
+            peak_sells = [t for t in peak_trades if t["side"] == "sell"]
+            peak_buys = [t for t in peak_trades if t["side"] == "buy"]
             
-    # 5. Group trades by wallet to calculate PnL
+            total_post_sells = len(interim_sells) + len(peak_sells)
+            if total_post_sells > 1:
+                continue
+                
+            remaining_tokens = net_tokens + sum(t["token_amount"] for t in interim_buys) - sum(t["token_amount"] for t in interim_sells) + sum(t["token_amount"] for t in peak_buys) - sum(t["token_amount"] for t in peak_sells)
+            
+            if total_post_sells == 1:
+                if remaining_tokens < net_tokens * 0.1:
+                    continue
+                
+        if bs.is_contract_address(wallet):
+            logger.info("Skipping contract address wallet candidate: %s", wallet)
+            continue
+            
+        candidate_wallets.append(wallet)
+        
+    logger.info("Found %d candidate wallets matching log-level filters.", len(candidate_wallets))
+    
+    # Collect all transaction hashes of the candidate wallets
+    candidate_tx_hashes = set()
+    for wallet in candidate_wallets:
+        for t in wallet_log_trades[wallet]:
+            candidate_tx_hashes.add(t["transaction_hash"])
+            
+    candidate_tx_hashes = list(candidate_tx_hashes)
+    if len(candidate_tx_hashes) > tx_limit:
+        logger.warning("Capping candidate transactions at %d.", tx_limit)
+        candidate_tx_hashes = candidate_tx_hashes[:tx_limit]
+        
+    capped_set = set(candidate_tx_hashes)
+    
+    # 5. Fetch transaction receipts in batches from RPC
+    logger.info("Fetching transaction receipts in batches for %d candidate transactions...", len(candidate_tx_hashes))
+    tx_legs_map = bs.get_transaction_token_transfers_batch(candidate_tx_hashes)
+    
+    # Group raw transfers by tx hash for the candidate txs
+    tx_groups = {}
+    for t in all_transfers:
+        tx_hash = t.get("transaction_hash")
+        if tx_hash in capped_set:
+            tx_groups.setdefault(tx_hash, []).append(t)
+            
+    trades = []
+    raw_trades = []
+    processed_count = 0
+    
+    for tx_hash, group in tx_groups.items():
+        tx_legs = tx_legs_map.get(tx_hash, [])
+        
+        senders = set()
+        receivers = set()
+        amounts_sent = {}
+        amounts_received = {}
+        
+        for t in group:
+            from_hash = (t.get("from") or {}).get("hash", "").lower()
+            to_hash = (t.get("to") or {}).get("hash", "").lower()
+            val_str = t.get("total", {}).get("value") or "0"
+            decimals = int(t.get("token", {}).get("decimals") or 18)
+            amount = float(val_str) / (10 ** decimals)
+            
+            if from_hash:
+                senders.add(from_hash)
+                amounts_sent[from_hash] = amounts_sent.get(from_hash, 0.0) + amount
+            if to_hash:
+                receivers.add(to_hash)
+                amounts_received[to_hash] = amounts_received.get(to_hash, 0.0) + amount
+                
+        original_senders = senders - receivers
+        final_receivers = receivers - senders
+        
+        token_lower = token_address.lower()
+        candidates_send = {s for s in original_senders if s not in pool_addresses and s != token_lower and s != "0x0000000000000000000000000000000000000000"}
+        candidates_recv = {r for r in final_receivers if r not in pool_addresses and r != token_lower and r != "0x0000000000000000000000000000000000000000"}
+        
+        pool_receivers = {t.get("to", {}).get("hash", "").lower() for t in group} & pool_addresses
+        pool_senders = {t.get("from", {}).get("hash", "").lower() for t in group} & pool_addresses
+        
+        side = None
+        wallet = None
+        amount = 0.0
+        
+        if pool_receivers and candidates_send:
+            side = "sell"
+            wallet = max(candidates_send, key=lambda s: amounts_sent.get(s, 0.0))
+            amount = amounts_sent[wallet]
+        elif pool_senders and candidates_recv:
+            side = "buy"
+            wallet = max(candidates_recv, key=lambda r: amounts_received.get(r, 0.0))
+            amount = amounts_received[wallet]
+            
+        if not side or not wallet or amount <= 0.0:
+            continue
+            
+        block_num = int(group[0].get("block_number") or 0)
+        approx_ts = anchor_ts + int((block_num - anchor_blk) * block_time)
+        
+        status = "PENDING"
+        usd_value = 0.0
+        # Reconstruct price using the other legs
+        for leg in tx_legs:
+            leg_token = (leg.get("token") or {}).get("address_hash", "").lower()
+            leg_val = float(leg.get("total", {}).get("value") or 0.0)
+            leg_dec = int((leg.get("token") or {}).get("decimals") or 18)
+            
+            # WETH
+            if leg_token == "0x0bd7d308f8e1639fab988df18a8011f41eacad73":
+                usd_value = (leg_val / (10 ** leg_dec)) * weth_price
+                break
+            # USDC / USDT
+            elif "usd" in (leg.get("token") or {}).get("symbol", "").lower():
+                usd_value = leg_val / (10 ** leg_dec)
+                break
+                
+        if usd_value == 0.0 and pair_address:
+            usd_value = amount * float(pair_address.get("priceUsd") or 0.0)
+            
+        if usd_value > 0.0:
+            status = "CONFIRMED"
+            
+        price_usd = usd_value / amount if amount > 0 else 0.0
+        
+        raw_trades.append({
+            "transaction_hash": tx_hash,
+            "timestamp": approx_ts,
+            "wallet": wallet,
+            "side": side,
+            "token_amount": amount,
+            "usd_value": usd_value,
+            "status": status,
+            "token": {"address": token_address, "symbol": "TOKEN"}
+        })
+        
+        trades.append({
+            "transaction_hash": tx_hash,
+            "timestamp": approx_ts,
+            "wallet": wallet,
+            "side": side,
+            "token_amount": amount,
+            "usd_value": usd_value,
+            "price": price_usd,
+        })
+        
+        processed_count += 1
+        if processed_count % 100 == 0:
+            logger.info("Processed %d/%d transactions...", processed_count, len(tx_groups))
+            
+    # 6. Group processed trades by wallet to calculate final aggregates
     wallet_trades = {}
     for tr in trades:
         wallet_trades.setdefault(tr["wallet"], []).append(tr)
         
     aggregates = []
     for wallet, w_trades in wallet_trades.items():
-        w_trades.sort(key=lambda x: x.get("timestamp") or 0)
-        
-        buys = [t for t in w_trades if t["side"] == "buy"]
-        sells = [t for t in w_trades if t["side"] == "sell"]
-        
-        total_buy_usd = sum(t["usd_value"] for t in buys)
-        total_sell_usd = sum(t["usd_value"] for t in sells)
-        total_buy_tokens = sum(t["token_amount"] for t in buys)
-        total_sell_tokens = sum(t["token_amount"] for t in sells)
-        
-        # Filter out wallets with a net (total sell - total buy) >= 0 in USD value
-        if total_sell_usd - total_buy_usd >= 0:
+        if wallet not in candidate_wallets:
             continue
             
-        # Target only wallets with a net buy (holding) position in this window
+        w_trades.sort(key=lambda x: x.get("timestamp") or 0)
+        
+        # Split trades into accumulation and peak window groups
+        # Split trades into accumulation, interim, and peak window groups
+        accum_trades = []
+        for t in w_trades:
+            in_accum = False
+            for s_ts, e_ts in windows:
+                if (s_ts is None or t["timestamp"] >= s_ts) and (e_ts is None or t["timestamp"] <= e_ts):
+                    in_accum = True
+                    break
+            if in_accum:
+                accum_trades.append(t)
+                
+        peak_trades = []
+        if peak_window:
+            p_start, p_end = peak_window
+            peak_trades = [t for t in w_trades if t["timestamp"] >= p_start and t["timestamp"] <= p_end]
+            
+        interim_trades = []
+        if peak_window and windows:
+            last_end_ts = max(e_ts for s_ts, e_ts in windows if e_ts is not None)
+            p_start, p_end = peak_window
+            interim_trades = [t for t in w_trades if t["timestamp"] > last_end_ts and t["timestamp"] < p_start]
+            
+        accum_buys = [t for t in accum_trades if t["side"] == "buy"]
+        accum_sells = [t for t in accum_trades if t["side"] == "sell"]
+        
+        total_buy_usd = sum(t["usd_value"] for t in accum_buys)
+        total_sell_usd = sum(t["usd_value"] for t in accum_sells)
+        total_buy_tokens = sum(t["token_amount"] for t in accum_buys)
+        total_sell_tokens = sum(t["token_amount"] for t in accum_sells)
+        
+        # Hard filter 1: Net buy in accumulation window must be >= $1,000 USD
+        if total_buy_usd - total_sell_usd < 1000:
+            continue
+            
+        # Target only wallets with a net buy (holding) position in accumulation window
         net_tokens = total_buy_tokens - total_sell_tokens
         if net_tokens <= 0:
             continue
+            
+        # Hard filter 2: Sells constraints & tag tagging
+        is_alpha_hunter = False
+        is_diamond_hand = False
+        if peak_window:
+            interim_sells = [t for t in interim_trades if t["side"] == "sell"]
+            interim_buys = [t for t in interim_trades if t["side"] == "buy"]
+            peak_sells = [t for t in peak_trades if t["side"] == "sell"]
+            peak_buys = [t for t in peak_trades if t["side"] == "buy"]
+            
+            total_post_sells = len(interim_sells) + len(peak_sells)
+            if total_post_sells > 1:
+                continue
+                
+            remaining_tokens = net_tokens + sum(t["token_amount"] for t in interim_buys) - sum(t["token_amount"] for t in interim_sells) + sum(t["token_amount"] for t in peak_buys) - sum(t["token_amount"] for t in peak_sells)
+            
+            if total_post_sells == 1:
+                if remaining_tokens < net_tokens * 0.1:
+                    continue
+                is_alpha_hunter = True
+            else:
+                is_diamond_hand = True
             
         realized_profit = 0.0
         pnl_ratio = 0.0
@@ -522,18 +808,22 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
         a.total_sell_usd = total_sell_usd
         a.total_buy_tokens = total_buy_tokens
         a.total_sell_tokens = total_sell_tokens
-        a.buy_count = len(buys)
-        a.sell_count = len(sells)
+        a.buy_count = len(accum_buys)
+        a.sell_count = len(accum_sells)
         a.realized_profit_usd = realized_profit
         a.tags = ["onchain_trader"]
-        
+        if is_alpha_hunter:
+            a.tags.append("alpha_hunter")
+        if is_diamond_hand:
+            a.tags.append("diamond_hand")
+            
         # Mark as sniper if they bought in first 5% of block range
         if w_trades and block_ranges:
             first_block = min(r[0] for r in block_ranges)
             last_block = max(r[1] for r in block_ranges)
             range_len = last_block - first_block
             if range_len > 0:
-                earliest_trade_block = min(t.get("timestamp") or last_block for t in w_trades)
+                earliest_trade_block = min(t.get("block_number") or last_block for t in w_trades)
                 if earliest_trade_block - first_block < range_len * 0.05:
                     a.tags.append("sniper")
                     
@@ -564,6 +854,7 @@ def main():
     parser.add_argument("--onchain", action="store_true", help="Legacy flag (on-chain is default).")
     parser.add_argument("--gmgn", action="store_true", help="Use GMGN top traders database instead of direct on-chain RPC scan.")
     parser.add_argument("--tx-limit", type=int, default=config.MAX_ONCHAIN_TRANSACTIONS, help="Max unique transactions to process in on-chain mode.")
+    parser.add_argument("--peak", nargs="+", help="Peak candle start time and optional duration (e.g. '25/7 18:00' '15m'). Duration defaults to '1h'.")
     args = parser.parse_args()
 
     if not config.GMGN_API_KEY:
@@ -576,6 +867,10 @@ def main():
         desc = "; ".join(f"{_ts_label(s)} -> {_ts_label(e)}" for s, e in windows)
         logger.info("Windowed mode (%d window(s)): %s", len(windows), desc)
         logger.info("Aggregates & transactions restricted to activity in these window(s).")
+
+    peak_window = _parse_peak_candle(args)
+    if peak_window:
+        logger.info("Peak candle window resolved: %s -> %s", _ts_label(peak_window[0]), _ts_label(peak_window[1]))
 
     token = args.token_address
     raw_trades = []
@@ -603,7 +898,7 @@ def main():
         logger.info("%d unique wallets across tag(s) %s", len(aggregates), tags)
     else:
         # Default mode: Direct On-Chain RPC Ingestion
-        aggregates, trades, raw_trades = build_onchain_aggregates(token, windows, limit=args.limit, tx_limit=args.tx_limit)
+        aggregates, trades, raw_trades = build_onchain_aggregates(token, windows, limit=args.limit, tx_limit=args.tx_limit, peak_window=peak_window)
         tags = ["onchain_trader"]
 
     # Pre-filter: enrich with stats and drop MEV/non-qualifying wallets early.

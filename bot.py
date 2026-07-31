@@ -149,6 +149,21 @@ def run_scan(args, extra_args):
     if args.window:
         sys_args.extend(_format_windows(args.window))
         
+    # Handle peak candle
+    if args.peak:
+        peak_list = list(args.peak)
+        if len(peak_list) > 1 and (peak_list[-1].endswith("m") or peak_list[-1].endswith("h")):
+            duration = peak_list.pop()
+        else:
+            duration = None
+            
+        date_str = " ".join(peak_list)
+        formatted_date = _parse_shorthand_date(date_str, "00:00")
+        
+        sys_args.extend(["--peak", formatted_date])
+        if duration:
+            sys_args.append(duration)
+        
     if args.onchain:
         sys_args.append("--onchain")
     if args.gmgn:
@@ -417,6 +432,10 @@ def main():
     scan_parser.add_argument(
         "--window", nargs="+", action="append", metavar="WINDOW",
         help="Shorthand time window. Relative (e.g. 24h, 7d) or exact (e.g. '07/07 19:00' '08/07 13:00')"
+    )
+    scan_parser.add_argument(
+        "--peak", nargs="+",
+        help="Peak candle start time and optional duration (e.g. '25/7 18:00' '15m'). Duration defaults to '1h'."
     )
     scan_parser.add_argument("--onchain", action="store_true", help="Legacy flag (on-chain is default).")
     scan_parser.add_argument("--gmgn", action="store_true", help="Use GMGN top traders database instead of direct on-chain scan.")

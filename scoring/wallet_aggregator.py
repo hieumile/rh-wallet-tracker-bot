@@ -180,6 +180,8 @@ INSIDER_TAG_LABELS = {
     "rat_trader": "insider(rat_trader)",
     "sniper": "sniper",
     "smart_degen": "smart_money",
+    "alpha_hunter": "alpha_hunter",
+    "diamond_hand": "diamond_hand",
 }
 
 

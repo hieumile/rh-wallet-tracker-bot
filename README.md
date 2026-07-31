@@ -11,19 +11,23 @@ Hệ thống hoạt động qua 3 phân hệ (subsystems) khép kín để phát
 1. **Thu thập dữ liệu (Ingestion)**: 
    * Mặc định quét trực tiếp On-Chain từ RPC Node của Robinhood Chain để bắt 100% ví giao dịch trong khung giờ.
    * **Hỗ trợ Đa bể thanh khoản (Multi-pool Support)**: Tự động phát hiện và phân tích giao dịch swap trên **tất cả các pool** của token (ví dụ: TOKEN-WETH, TOKEN-USDG, TOKEN-NVDA) thay vì chỉ quét một pool chính có thanh khoản cao nhất.
+   * **Hỗ trợ Uniswap V4 PoolManager**: Tự động nhận diện và phân tích dòng tiền giao dịch Uniswap V4 bằng cách phân giải các Pool ID (32-byte hash) của DexScreener thành các giao dịch tương tác trực tiếp với hợp đồng Vault/PoolManager trung tâm (`0x8366a39cc670b4001a1121b8f6a443a643e40951`).
    * **Tải song song (Parallel Ingestion)**: Sử dụng luồng chạy song song (`ThreadPoolExecutor`) với mặc định 8 luồng chạy đồng thời giúp tăng tốc độ quét giao dịch lên gấp 5-10 lần.
    * Dùng tùy chọn `--gmgn` để khai thác cơ sở dữ liệu Top Traders của GMGN.
 2. **Đánh giá & Lọc ví (Scoring Engine)**: 
+   * **Phân tích Dòng chảy Token (Flow Analysis)**: Nhóm toàn bộ log chuyển tiền theo Transaction Hash để giải mã chính xác các giao dịch hoán đổi định tuyến gián tiếp (ví dụ: `User -> Router -> Pool`). Xác định chính xác địa chỉ ví gốc (EOA) giao dịch thay vì ghi nhận nhầm hợp đồng Router.
    * Lọc ví **Net Buyer** (mua USD > bán USD & mua Token > bán Token) để chỉ giữ lại các ví gom hàng thực sự trong khung giờ.
    * Loại bỏ ví MEV/Sandwich (hold dưới 60s) và lọc bot giao dịch (số lệnh > 500).
    * Lọc thời gian nghiêm ngặt (**Strict Window Filtering**): Loại bỏ các giao dịch nằm ngoài khung giờ quét thực tế khỏi danh mục chấm điểm (đánh dấu là `OUT_OF_WINDOW`).
+   * **Định tuổi Khối Động (Dynamic Block Time)**: Tự động ước lượng block time thực tế dựa trên chênh lệch block biên của khung thời gian, loại bỏ hoàn toàn sai lệch múi giờ giao dịch (`approx_ts`).
+   * **Tìm kiếm Khối Bền Bỉ (Robust RPC Search Fallback)**: Tự động chuyển đổi sang cơ chế ước lượng tuyến tính (`now_ts - (hi - mid) * 0.1`) và áp dụng retry exponential backoff 5 lần khi RPC bị lỗi 429 hoặc timeout trong quá trình tìm khối.
    * Chấm điểm điểm số tổng hợp (**Composite Score**) dựa trên: Winrate, PnL Ratio, Profit, Volume, Sharpe Ratio, Profit Factor, Max Drawdown và Moonshot. Các ví có điểm số >= 40.0 được tự động lưu vào `output/watchlist.json` và đồng bộ ra `output/watchlist.xlsx`.
 3. **Phát tín hiệu (Signal Generator)**: Theo dõi danh sách ví trong watchlist để đưa ra cảnh báo giao dịch (`BUY/SELL`), cảnh báo ví mẹ cấp vốn cho ví con mới (`FUNDING`), và cảnh báo mua chung (`Co-Investment`).
 
 ```mermaid
 graph TD
     A[Token Mục Tiêu] -->|RPC Node On-Chain Default / GMGN --gmgn| B(Thu Thập Ví Net Buyer)
-    B -->|Hỗ trợ Multi-pool & Tải Song Song 8 Luồng| C[Scoring Engine: Lọc MEV, Bot & Trích xuất Net USD Buy + Chấm Điểm Composite]
+    B -->|Hỗ trợ Multi-pool, Uniswap V4 & Tải Song Song| C[Scoring Engine: Nhóm Tx Flow Analysis, Lọc MEV, Bot & Trích xuất Net USD Buy + Chấm Điểm]
     C -->|Gộp & Lưu| D[output/watchlist.json / output/watchlist.xlsx]
     C -->|Xuất Báo Cáo| E[Spreadsheets Excel Trong Thư Mục output/]
     D -->|Live Scan| F[Signal Generator]
@@ -101,9 +105,15 @@ Xóa thủ công một hoặc nhiều ví khỏi danh sách theo dõi và tự �
 ### A. Các bộ lọc cứng (Gatekeeper Filters):
 * **Lọc Ví Net Buyer**:
   * **Token**: Chỉ chấp nhận ví có lượng mua lớn hơn lượng bán (`total_buy_tokens > total_sell_tokens`) trong khung thời gian quét.
-  * **Giá trị USD**: Chỉ chấp nhận ví có tổng giá trị mua USD lớn hơn tổng giá trị bán USD trong khung thời gian quét (tương đương `total_sell_usd - total_buy_usd < 0`).
+  * **Giá trị USD**: Chỉ chấp nhận ví có lượng mua ròng (net buy) đạt từ **$1,000 trở lên** trong khung thời gian quét (`total_buy_usd - total_sell_usd >= 1000`).
+* **Lọc Bán Sau Tích Lũy (Post-Accumulation Sells Constraint)**:
+  * Cho phép tối đa **1 giao dịch bán duy nhất** (`total_post_sells <= 1`) trong toàn bộ quá trình từ lúc kết thúc gom hàng đến hết nến đỉnh. Các ví xả nhiều lần (swing trading, grid bots) bị loại bỏ.
+  * **Chống xả sạch vị thế (No "Sell All" Constraint)**: Nếu ví bán 1 lần (`total_post_sells == 1`), lượng token nắm giữ còn lại tại nến đỉnh phải **đạt ít nhất 10%** so với lượng token gom ban đầu. Nếu xả sạch hoặc chỉ để lại ví bụi lẻ ($<10\%$) sẽ bị loại bỏ.
+  * **Phân loại Nhãn**:
+    * **`diamond_hand`**: Không thực hiện bất kỳ lệnh bán nào sau tích lũy (`total_post_sells == 0`).
+    * **`alpha_hunter`**: Thực hiện đúng 1 lệnh bán một phần (`total_post_sells == 1`) và vẫn duy trì tối thiểu 10% vị thế.
 * **Loại bỏ MEV/Sandwich**: Loại bỏ ví có tag `sandwich_bot` hoặc thời gian nắm giữ trung bình dưới 60 giây.
-* **Lọc Bot giao dịch**: Loại bỏ các ví thực hiện **trên 500 giao dịch** (`MAX_TX_COUNT = 500`) trong 30 ngày (nâng giới hạn để tránh loại bỏ ví hoạt động mạnh).
+* **Lọc Bot giao dịch**: Loại bỏ các ví thực hiện **trên 500 giao dịch** (`MAX_TX_COUNT = 500`) trong 30 ngày.
 
 > [!NOTE]
 > Các bộ lọc khác (Lọc độ tuổi tối thiểu, Max Drawdown, Win Rate, Volume, Lợi nhuận tối thiểu) đã được chuyển đổi hoàn toàn sang **chế độ chấm điểm trọng số (Composite Scoring)** chứ không còn là bộ lọc cứng để tránh bỏ sót các ví tiềm năng.
