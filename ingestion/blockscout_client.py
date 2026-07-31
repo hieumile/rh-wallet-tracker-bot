@@ -11,8 +11,12 @@ Nothing here executes trades or writes anywhere — read-only HTTP GETs.
 """
 
 import time
+import json
 import logging
+import os
+import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import config
 
@@ -65,8 +69,46 @@ def _get(path: str, params: dict | None = None) -> dict:
     raise BlockscoutError(f"Blockscout GET {path} failed after maximum retry attempts")
 
 
-def is_contract_address(address: str) -> bool:
-    """Check if an address is a smart contract (contains bytecode) on Robinhood Chain."""
+# ---------------------------------------------------------------------------
+# Persistent is-contract cache
+# ---------------------------------------------------------------------------
+_CONTRACT_CACHE_PATH = os.path.join(os.path.dirname(__file__), "..", "output", ".contract_cache.json")
+_contract_cache: dict[str, bool] = {}
+_contract_cache_lock = threading.Lock()
+_contract_cache_dirty = False
+
+def _load_contract_cache() -> None:
+    """Load the on-disk cache into memory (called once at startup)."""
+    global _contract_cache
+    path = os.path.abspath(_CONTRACT_CACHE_PATH)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                _contract_cache = json.load(f)
+            logger.debug("Loaded %d entries from contract cache.", len(_contract_cache))
+        except Exception as e:
+            logger.warning("Could not load contract cache: %s", e)
+            _contract_cache = {}
+
+def _save_contract_cache() -> None:
+    """Flush the in-memory cache to disk."""
+    global _contract_cache_dirty
+    path = os.path.abspath(_CONTRACT_CACHE_PATH)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with _contract_cache_lock:
+            with open(path, "w") as f:
+                json.dump(_contract_cache, f)
+            _contract_cache_dirty = False
+    except Exception as e:
+        logger.warning("Could not save contract cache: %s", e)
+
+# Load cache on module import
+_load_contract_cache()
+
+
+def _rpc_is_contract(address: str) -> bool:
+    """Single RPC call to check if *address* contains bytecode. No cache logic."""
     rpc_url = "https://rpc.mainnet.chain.robinhood.com"
     payload = {
         "jsonrpc": "2.0",
@@ -81,10 +123,89 @@ def is_contract_address(address: str) -> bool:
                 result = r.json().get("result") or "0x"
                 return result != "0x" and result != ""
             elif r.status_code == 429:
-                time.sleep(1.0)
+                time.sleep(1.5 * (attempt + 1))
         except Exception:
-            pass
+            time.sleep(0.5)
     return False
+
+
+def is_contract_address(address: str) -> bool:
+    """Cache-first check: returns True if *address* is a smart contract.
+    
+    Results are persisted to disk so each address is only queried once
+    across all bot runs, regardless of which token is being scanned.
+    """
+    global _contract_cache_dirty
+    addr = address.lower()
+    with _contract_cache_lock:
+        if addr in _contract_cache:
+            return _contract_cache[addr]
+    result = _rpc_is_contract(addr)
+    with _contract_cache_lock:
+        _contract_cache[addr] = result
+        _contract_cache_dirty = True
+    return result
+
+
+def batch_is_contract(addresses: list[str], max_workers: int = 20) -> dict[str, bool]:
+    """Check many addresses concurrently, using the cache to skip known ones.
+    
+    Returns a dict mapping address -> is_contract. Unknown addresses are
+    queried in parallel (up to *max_workers* threads) and results are
+    saved to the persistent cache automatically.
+    
+    Args:
+        addresses: List of lowercase wallet addresses to check.
+        max_workers: Thread pool size. Keep <= 20 to avoid RPC throttling.
+    """
+    global _contract_cache_dirty
+    results: dict[str, bool] = {}
+    uncached: list[str] = []
+
+    # Serve from cache first
+    with _contract_cache_lock:
+        for addr in addresses:
+            a = addr.lower()
+            if a in _contract_cache:
+                results[a] = _contract_cache[a]
+            else:
+                uncached.append(a)
+
+    if not uncached:
+        return results
+
+    logger.debug("batch_is_contract: %d cached, %d need RPC calls.", len(results), len(uncached))
+
+    # Fetch unknown addresses in parallel
+    completed = 0
+    total_uncached = len(uncached)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_addr = {executor.submit(_rpc_is_contract, addr): addr for addr in uncached}
+        for future in as_completed(future_to_addr):
+            addr = future_to_addr[future]
+            try:
+                val = future.result()
+            except Exception:
+                val = False
+            results[addr] = val
+            completed += 1
+            if completed % 500 == 0 or completed == total_uncached:
+                logger.info(
+                    "Batch contract check: %d/%d done (%.0f%%)...",
+                    completed, total_uncached, completed / total_uncached * 100
+                )
+
+    # Persist new results
+    with _contract_cache_lock:
+        for addr, val in results.items():
+            if addr not in _contract_cache:
+                _contract_cache[addr] = val
+                _contract_cache_dirty = True
+
+    if _contract_cache_dirty:
+        _save_contract_cache()
+
+    return results
 
 
 def get_latest_block_number() -> int:
@@ -260,7 +381,9 @@ def _fetch_chunk_with_split(token_address: str, current_start: int, current_end:
                     })
                 return chunk_transfers
             else:
+                import random
                 backoff = min((2.0 ** attempt) * 3.0, 30.0) if r.status_code == 429 else 2.0
+                backoff = backoff + random.uniform(1.0, 3.0)
                 logger.warning("RPC returned status %d (attempt %d/10) for range %d-%d, retrying after %.1fs...", r.status_code, attempt + 1, current_start, current_end, backoff)
                 time.sleep(backoff)
         except Exception as e:
@@ -272,7 +395,10 @@ def _fetch_chunk_with_split(token_address: str, current_start: int, current_end:
                 left = _fetch_chunk_with_split(token_address, current_start, mid, decimals, transfer_topic, rpc_url)
                 right = _fetch_chunk_with_split(token_address, mid + 1, current_end, decimals, transfer_topic, rpc_url)
                 return left + right
-            backoff = min((2.0 ** attempt) * 2.0, 20.0)
+            import random
+            is_net_error = any(kw in err_msg for kw in ["resolution", "conn", "resolve", "timeout", "abort", "reset"])
+            backoff = 10.0 if is_net_error else min((2.0 ** attempt) * 2.0, 20.0)
+            backoff = backoff + random.uniform(1.0, 3.0)
             logger.warning("RPC call failed (attempt %d/10) for range %d-%d: %s. Retrying after %.1fs...", attempt + 1, current_start, current_end, e, backoff)
             time.sleep(backoff)
             
@@ -297,8 +423,8 @@ def get_token_transfers(token_address: str, start_block: int, end_block: int) ->
     rpc_url = "https://rpc.mainnet.chain.robinhood.com"
     transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
     
-    # Chunk size: 100,000 blocks to stay within RPC limits while minimizing request count
-    chunk_size = 100000
+    # Chunk size: 50,000 blocks to prevent RPC timeouts and keep queries lightweight
+    chunk_size = 50000
     
     # Generate chunks
     chunks = []
@@ -311,8 +437,8 @@ def get_token_transfers(token_address: str, start_block: int, end_block: int) ->
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
     transfers = []
-    # Use 4 threads to fetch chunks concurrently to stay within RPC limits
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    # Use 2 threads to fetch chunks concurrently to stay within RPC limits
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {executor.submit(_fetch_chunk_with_split, token_address, s, e, decimals, transfer_topic, rpc_url): (s, e) for s, e in chunks}
         
         processed_chunks = 0

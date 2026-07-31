@@ -524,9 +524,73 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
     candidate_wallets = []
     total_wallets = len(wallet_log_trades)
     logger.info("Analyzing %d unique wallets at log-level...", total_wallets)
+
+    # --- Optimisation 1: early pre-filter -----------------------------------
+    # Drop wallets that have zero buy trades in the accumulation window right
+    # now — they can never become net buyers and don't need the full analysis.
+    def _has_accum_buy(w_trades: list) -> bool:
+        for t in w_trades:
+            if t["side"] != "buy":
+                continue
+            for s_ts, e_ts in windows:
+                if (s_ts is None or t["timestamp"] >= s_ts) and (e_ts is None or t["timestamp"] <= e_ts):
+                    return True
+        return False
+
+    wallet_log_trades = {w: tr for w, tr in wallet_log_trades.items() if _has_accum_buy(tr)}
+    pre_filter_count = total_wallets - len(wallet_log_trades)
+    logger.info(
+        "Pre-filter removed %d wallets with no accumulation-window buys. %d remain.",
+        pre_filter_count, len(wallet_log_trades)
+    )
+
+    # --- Optimisation 1b: top-N net token pre-filter -------------------------
+    # Before calling eth_getCode for thousands of addresses, rank all remaining
+    # wallets by their net token position in the accumulation window and keep
+    # only the top N. Smart money typically holds the largest positions, so
+    # this cut drastically reduces RPC calls while retaining signal quality.
+    TOP_N = 200
+
+    def _calc_net_accum_tokens(w_trades: list) -> float:
+        total_buy = sum(
+            t["token_amount"] for t in w_trades
+            if t["side"] == "buy"
+            and any(
+                (s_ts is None or t["timestamp"] >= s_ts) and (e_ts is None or t["timestamp"] <= e_ts)
+                for s_ts, e_ts in windows
+            )
+        )
+        total_sell = sum(
+            t["token_amount"] for t in w_trades
+            if t["side"] == "sell"
+            and any(
+                (s_ts is None or t["timestamp"] >= s_ts) and (e_ts is None or t["timestamp"] <= e_ts)
+                for s_ts, e_ts in windows
+            )
+        )
+        return total_buy - total_sell
+
+    if len(wallet_log_trades) > TOP_N:
+        ranked = sorted(wallet_log_trades.items(), key=lambda kv: _calc_net_accum_tokens(kv[1]), reverse=True)
+        wallet_log_trades = dict(ranked[:TOP_N])
+        logger.info("Top-%d net-token filter applied: %d wallets kept for contract check.", TOP_N, len(wallet_log_trades))
+    else:
+        logger.info("Top-%d filter skipped: only %d wallets remain.", TOP_N, len(wallet_log_trades))
+
+    # --- Optimisation 2: batch is-contract check (concurrent + cached) ------
+    # Run all eth_getCode calls in parallel upfront so the per-wallet loop
+    # below only does an O(1) dict lookup instead of a serial RPC call.
+    all_wallet_addrs = list(wallet_log_trades.keys())
+    logger.info("Batch-checking %d addresses for contract bytecode (parallel + cache)...", len(all_wallet_addrs))
+    contract_map = bs.batch_is_contract(all_wallet_addrs, max_workers=5)
+    logger.info(
+        "Contract check complete: %d contracts, %d EOAs.",
+        sum(contract_map.values()), sum(1 for v in contract_map.values() if not v)
+    )
+
     for idx_w, (wallet, w_trades) in enumerate(wallet_log_trades.items()):
-        if (idx_w + 1) % 100 == 0 or idx_w + 1 == total_wallets:
-            logger.info("Analyzed %d/%d wallets...", idx_w + 1, total_wallets)
+        if (idx_w + 1) % 500 == 0 or idx_w + 1 == len(wallet_log_trades):
+            logger.info("Analyzed %d/%d wallets...", idx_w + 1, len(wallet_log_trades))
         w_trades.sort(key=lambda x: x["timestamp"])
         
         # Split trades into accumulation, interim, and peak window groups
@@ -577,8 +641,8 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
                 if remaining_tokens < net_tokens * 0.1:
                     continue
                 
-        if bs.is_contract_address(wallet):
-            logger.info("Skipping contract address wallet candidate: %s", wallet)
+        if contract_map.get(wallet, False):
+            logger.debug("Skipping contract address wallet candidate: %s", wallet)
             continue
             
         candidate_wallets.append(wallet)
@@ -1000,7 +1064,11 @@ def main():
     print_scores(scores)
 
     # Filter out wallets that do not meet the minimum quality score threshold for the watchlist
-    watchlist_scores = [s for s in scores if s.score >= config.MIN_WATCHLIST_SCORE]
+    watchlist_scores = [
+        s for s in scores
+        if s.score >= config.MIN_WATCHLIST_SCORE
+        and (s.realized_profit_usd or 0) >= config.MIN_WATCHLIST_PROFIT_USD
+    ]
 
     if watchlist_scores and not args.no_watchlist:
         watchlist_map = wl.upsert(

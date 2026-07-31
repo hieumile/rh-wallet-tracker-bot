@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 watchlist.json
 *.xlsx
+output/.contract_cache.json

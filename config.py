@@ -84,6 +84,7 @@ EXCLUDE_TAGS = {"sandwich_bot", "uniswap_v3_multicall"}
 MAX_DRAWDOWN_RATIO_LIMIT = 0.60  # exclude wallets with max drawdown > 60% of peak profit
 MAX_TX_COUNT = 500               # exclude wallets with > 500 transactions in period (trading bots)
 MIN_WATCHLIST_SCORE = 60.0       # minimum composite score required to enter the watchlist
+MIN_WATCHLIST_PROFIT_USD = 1000.0  # minimum realized profit (USD) required to enter the watchlist
 PROFIT_FACTOR_CAP = 2.0          # profit factor that maxes the profit_factor component
 SHARPE_CAP = 1.5                 # Sharpe ratio that maxes the sharpe component
 VOLUME_FULL_SCORE_USD = 200_000  # trading volume (USD) that maxes the volume component
