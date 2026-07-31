@@ -193,6 +193,17 @@ def _score_components(agg: WalletAggregate) -> dict[str, float]:
     dd_ratio = agg.wallet_max_drawdown_ratio or 0.0
     drawdown_component = _clamp01(1.0 - dd_ratio)
 
+    # Conviction component: rewards wallets that make few large buys with low
+    # sell pressure during the accumulation window ("mua chac tay, khong fomo").
+    #   avg_buy_size  — high means concentrated buying, not scattered FOMO entries
+    #   sell_pressure — low means they held through accumulation, not flipping
+    avg_buy = agg.avg_buy_usd or 0.0
+    avg_buy_norm = _clamp01(avg_buy / config.CONVICTION_AVG_BUY_CAP)
+    sell_pressure = 0.0
+    if agg.total_buy_usd > 0:
+        sell_pressure = _clamp01(agg.total_sell_usd / agg.total_buy_usd)
+    conviction_component = avg_buy_norm * (1.0 - sell_pressure)
+
     return {
         "winrate": _clamp01(winrate),
         "pnl_ratio": pnl_component,
@@ -202,6 +213,7 @@ def _score_components(agg: WalletAggregate) -> dict[str, float]:
         "sharpe": sharpe_component,
         "drawdown": drawdown_component,
         "moonshot": moonshot_component,
+        "conviction": conviction_component,
     }
 
 

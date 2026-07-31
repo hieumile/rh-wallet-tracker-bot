@@ -101,13 +101,15 @@ SCORE_WEIGHTS = {
     "winrate": 10,      # ratio of profitable trades
     "pnl_ratio": 10,    # realized_profit / total_cost
     "profit": 25,       # absolute realized profit (log-scaled)
-    "volume": 20,       # overall trading volume (log-scaled)
-    "profit_factor": 10, # gross profit / gross loss (increased from 15)
-    "sharpe": 10,       # risk-adjusted return ratio (increased from 10)
+    "volume": 10,       # overall trading volume (log-scaled) — reduced to make room for conviction
+    "profit_factor": 10, # gross profit / gross loss
+    "sharpe": 10,       # risk-adjusted return ratio
     "drawdown": 10,     # control of maximum asset drawdown from peak
     "moonshot": 5,      # share of trades that returned > 2x
+    "conviction": 10,   # avg buy size × low sell pressure in accum window
 }
 PROFIT_FULL_SCORE_USD = 100_000  # realized profit that maxes the profit component
+CONVICTION_AVG_BUY_CAP = 500.0  # $500 avg buy/trade = full conviction score
 
 # Persisted output that Subsystem 3 (signal generator) will consume.
 WATCHLIST_PATH = "output/watchlist.json"

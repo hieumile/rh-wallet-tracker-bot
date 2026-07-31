@@ -64,6 +64,9 @@ class WalletAggregate:
     wallet_sharpe_ratio: float | None = None      # risk-adjusted return ratio
     stats_period: str | None = None
 
+    # On-chain conviction metrics (derived from accum-window trades, no extra API call)
+    avg_buy_usd: float | None = None   # total_buy_usd / buy_count — high = conviction
+
     first_ts: int | None = None
     last_ts: int | None = None
 

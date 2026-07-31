@@ -875,6 +875,7 @@ def build_onchain_aggregates(token_address: str, windows: list[tuple[int | None,
         a.buy_count = len(accum_buys)
         a.sell_count = len(accum_sells)
         a.realized_profit_usd = realized_profit
+        a.avg_buy_usd = total_buy_usd / len(accum_buys) if accum_buys else None
         a.tags = ["onchain_trader"]
         if is_alpha_hunter:
             a.tags.append("alpha_hunter")
