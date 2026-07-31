@@ -202,6 +202,83 @@ def get_block_by_timestamp(target_ts: int, latest_block: int | None = None) -> i
     return best_block
 
 
+def _fetch_chunk_with_split(token_address: str, current_start: int, current_end: int, decimals: int, transfer_topic: str, rpc_url: str) -> list[dict]:
+    import time
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_getLogs",
+        "params": [{
+            "fromBlock": hex(current_start),
+            "toBlock": hex(current_end),
+            "address": token_address,
+            "topics": [transfer_topic]
+        }],
+        "id": 1
+    }
+    
+    for attempt in range(10):
+        try:
+            r = requests.post(rpc_url, json=payload, headers={"Content-Type": "application/json"}, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                if "error" in data:
+                    err = data["error"] or {}
+                    err_msg = str(err.get("message", "")).lower()
+                    if "exceeds limit" in err_msg or "limit of 10000" in err_msg or "too many" in err_msg:
+                        if current_start >= current_end:
+                            return []
+                        mid = (current_start + current_end) // 2
+                        left = _fetch_chunk_with_split(token_address, current_start, mid, decimals, transfer_topic, rpc_url)
+                        right = _fetch_chunk_with_split(token_address, mid + 1, current_end, decimals, transfer_topic, rpc_url)
+                        return left + right
+                    else:
+                        raise BlockscoutError(f"RPC Error: {err}")
+                
+                results = data.get("result", [])
+                chunk_transfers = []
+                for log in results:
+                    topics = log.get("topics") or []
+                    if len(topics) < 3:
+                        continue
+                    block_num = int(log["blockNumber"], 16)
+                    tx_hash = log["transactionHash"]
+                    from_addr = "0x" + topics[1][-40:]
+                    to_addr = "0x" + topics[2][-40:]
+                    val_hex = log.get("data") or "0x0"
+                    try:
+                        value = int(val_hex, 16)
+                    except ValueError:
+                        value = 0
+                        
+                    chunk_transfers.append({
+                        "block_number": block_num,
+                        "transaction_hash": tx_hash,
+                        "from": {"hash": from_addr},
+                        "to": {"hash": to_addr},
+                        "total": {"value": str(value)},
+                        "token": {"decimals": decimals, "address": token_address}
+                    })
+                return chunk_transfers
+            else:
+                backoff = min((2.0 ** attempt) * 3.0, 30.0) if r.status_code == 429 else 2.0
+                logger.warning("RPC returned status %d (attempt %d/10) for range %d-%d, retrying after %.1fs...", r.status_code, attempt + 1, current_start, current_end, backoff)
+                time.sleep(backoff)
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "exceeds limit" in err_msg or "limit of 10000" in err_msg or "too many" in err_msg:
+                if current_start >= current_end:
+                    return []
+                mid = (current_start + current_end) // 2
+                left = _fetch_chunk_with_split(token_address, current_start, mid, decimals, transfer_topic, rpc_url)
+                right = _fetch_chunk_with_split(token_address, mid + 1, current_end, decimals, transfer_topic, rpc_url)
+                return left + right
+            backoff = min((2.0 ** attempt) * 2.0, 20.0)
+            logger.warning("RPC call failed (attempt %d/10) for range %d-%d: %s. Retrying after %.1fs...", attempt + 1, current_start, current_end, e, backoff)
+            time.sleep(backoff)
+            
+    raise BlockscoutError(f"Failed to fetch logs for range {current_start}-{current_end}")
+
+
 def get_token_transfers(token_address: str, start_block: int, end_block: int) -> list[dict]:
     """
     Pull all token-transfer events for a given ERC-20 token contract
@@ -222,83 +299,34 @@ def get_token_transfers(token_address: str, start_block: int, end_block: int) ->
     
     # Chunk size: 100,000 blocks to stay within RPC limits while minimizing request count
     chunk_size = 100000
-    transfers: list[dict] = []
     
+    # Generate chunks
+    chunks = []
     current_start = start_block
     while current_start <= end_block:
         current_end = min(current_start + chunk_size - 1, end_block)
+        chunks.append((current_start, current_end))
+        current_start += chunk_size
         
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "eth_getLogs",
-            "params": [{
-                "fromBlock": hex(current_start),
-                "toBlock": hex(current_end),
-                "address": token_address,
-                "topics": [transfer_topic]
-            }],
-            "id": 1
-        }
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    transfers = []
+    # Use 4 threads to fetch chunks concurrently to stay within RPC limits
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(_fetch_chunk_with_split, token_address, s, e, decimals, transfer_topic, rpc_url): (s, e) for s, e in chunks}
         
-        success = False
-        for attempt in range(3):
+        processed_chunks = 0
+        for future in as_completed(futures):
+            s, e = futures[future]
             try:
-                # Override auth headers from session to make a clean RPC call
-                r = requests.post(rpc_url, json=payload, headers={"Content-Type": "application/json"}, timeout=config.REQUEST_TIMEOUT_SECONDS)
-                if r.status_code == 200:
-                    data = r.json()
-                    if "error" in data:
-                        raise BlockscoutError(f"RPC Error: {data['error']}")
-                    
-                    results = data.get("result", [])
-                    for log in results:
-                        topics = log.get("topics") or []
-                        if len(topics) < 3:
-                            continue
-                        
-                        block_num = int(log["blockNumber"], 16)
-                        tx_hash = log["transactionHash"]
-                        from_addr = "0x" + topics[1][-40:]
-                        to_addr = "0x" + topics[2][-40:]
-                        
-                        val_hex = log.get("data") or "0x0"
-                        try:
-                            value = int(val_hex, 16)
-                        except ValueError:
-                            value = 0
-                            
-                        transfers.append({
-                            "block_number": block_num,
-                            "transaction_hash": tx_hash,
-                            "from": {"hash": from_addr},
-                            "to": {"hash": to_addr},
-                            "total": {"value": str(value)},
-                            "token": {"decimals": decimals, "address": token_address}
-                        })
-                    
-                    success = True
-                    break
-                else:
-                    backoff = 3.0 if r.status_code == 429 else 1.0
-                    logger.warning("RPC returned status %d (attempt %d/3), retrying after %.1fs...", r.status_code, attempt + 1, backoff)
-                    time.sleep(backoff)
-            except Exception as e:
-                logger.warning("RPC call failed (attempt %d/3): %s. Retrying after 2.0s...", attempt + 1, e)
-                time.sleep(2.0)
+                chunk_res = future.result()
+                transfers.extend(chunk_res)
+                processed_chunks += 1
+                logger.info("Ingested transfers chunk %d/%d (blocks %d-%d), found %d transfers in chunk.", processed_chunks, len(chunks), s, e, len(chunk_res))
+            except Exception as ex:
+                logger.error("Failed to fetch transfers for chunk %d-%d: %s", s, e, ex)
+                raise ex
                 
-        if not success:
-            raise BlockscoutError(f"Failed to fetch RPC logs for block range {current_start}-{current_end}")
-            
-        # Log progress for transfer ingestion
-        processed_blocks = min(current_end - start_block + 1, end_block - start_block + 1)
-        total_blocks = end_block - start_block + 1
-        logger.info(
-            "Fetching transfers: parsed %d/%d blocks (chunk: %d-%d), found %d transfers so far...",
-            processed_blocks, total_blocks, current_start, current_end, len(transfers)
-        )
-            
-        current_start = current_end + 1
-        
     # Sort transfers descending (newest block number first) to match Blockscout API sorting
     transfers.sort(key=lambda x: x["block_number"], reverse=True)
     return transfers
